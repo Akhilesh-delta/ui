@@ -1,1539 +1,1661 @@
 const User = require('../models/User');
 const Cart = require('../models/Cart');
-const { 
-  generateToken, 
-  generateRefreshToken, 
-  hashPassword, 
-  comparePassword,
-  generateEmailVerificationToken,
-  generatePasswordResetToken,
-  hashToken,
-  isValidEmail,
-  isValidPhone,
-  sanitizeInput,
-  authRateLimit
-} = require('../middleware/authMiddleware');
-const { sendEmail } = require('../services/emailService');
-const { sendSMS } = require('../services/smsService');
+const Order = require('../models/Order');
+const Payment = require('../models/Payment');
+const Review = require('../models/Review');
+const Notification = require('../models/Notification');
+const Store = require('../models/Store');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
+const { validationResult } = require('express-validator');
+const speakeasy = require('speakeasy');
+const nodemailer = require('nodemailer');
+const twilio = require('twilio');
+const { AppError, catchAsync } = require('../middleware/errorHandler');
+const logger = require('../utils/logger');
 
-// @desc    Register new user
-// @route   POST /api/users/register
-// @access  Public
-const registerUser = async (req, res) => {
-  try {
+// Email transporter configuration
+const emailTransporter = nodemailer.createTransporter({
+  host: process.env.SMTP_HOST,
+  port: process.env.SMTP_PORT,
+  secure: false,
+  auth: {
+    user: process.env.SMTP_USER,
+    pass: process.env.SMTP_PASS
+  }
+});
+
+// SMS client configuration
+const smsClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
+
+class UserController {
+  // ===============================
+  // AUTHENTICATION & REGISTRATION
+  // ===============================
+
+  // Register new user
+  register = catchAsync(async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({
+        error: 'Validation failed',
+        details: errors.array()
+      });
+    }
+
     const {
       firstName,
       lastName,
       email,
-      phone,
       password,
-      confirmPassword,
-      role = 'user',
-      referralCode,
-      acceptTerms,
-      marketingEmails
+      phone,
+      dateOfBirth,
+      gender,
+      role = 'customer',
+      referralCode
     } = req.body;
 
-    // Validate required fields
-    if (!firstName || !lastName || !email || !password || !confirmPassword) {
-      return res.status(400).json({
-        success: false,
-        error: 'Please provide all required fields'
-      });
-    }
-
-    // Sanitize inputs
-    const sanitizedFirstName = sanitizeInput(firstName);
-    const sanitizedLastName = sanitizeInput(lastName);
-    const sanitizedEmail = sanitizeInput(email).toLowerCase();
-    const sanitizedPhone = phone ? sanitizeInput(phone) : null;
-
-    // Validate email format
-    if (!isValidEmail(sanitizedEmail)) {
-      return res.status(400).json({
-        success: false,
-        error: 'Please provide a valid email address'
-      });
-    }
-
-    // Validate phone format if provided
-    if (sanitizedPhone && !isValidPhone(sanitizedPhone)) {
-      return res.status(400).json({
-        success: false,
-        error: 'Please provide a valid phone number'
-      });
-    }
-
-    // Validate password strength
-    if (password.length < 8) {
-      return res.status(400).json({
-        success: false,
-        error: 'Password must be at least 8 characters long'
-      });
-    }
-
-    if (password !== confirmPassword) {
-      return res.status(400).json({
-        success: false,
-        error: 'Passwords do not match'
-      });
-    }
-
-    // Validate terms acceptance
-    if (!acceptTerms) {
-      return res.status(400).json({
-        success: false,
-        error: 'Please accept the terms and conditions'
-      });
-    }
-
     // Check if user already exists
-    const existingUser = await User.findByEmailOrPhone(sanitizedEmail);
-    if (existingUser) {
-      return res.status(400).json({
-        success: false,
-        error: 'User with this email already exists'
-      });
-    }
+    const existingUser = await User.findOne({
+      $or: [
+        { email: email.toLowerCase() },
+        { phone }
+      ]
+    });
 
-    // Check if phone already exists (if provided)
-    if (sanitizedPhone) {
-      const phoneExists = await User.findOne({ phone: sanitizedPhone });
-      if (phoneExists) {
-        return res.status(400).json({
-          success: false,
-          error: 'User with this phone number already exists'
-        });
+    if (existingUser) {
+      if (existingUser.email === email.toLowerCase()) {
+        throw new AppError('Email already registered', 400, true, 'EMAIL_EXISTS');
+      }
+      if (existingUser.phone === phone) {
+        throw new AppError('Phone number already registered', 400, true, 'PHONE_EXISTS');
       }
     }
 
-    // Hash password
-    const hashedPassword = await hashPassword(password);
-
-    // Generate email verification token
-    const emailVerificationToken = generateEmailVerificationToken();
-    const hashedEmailToken = hashToken(emailVerificationToken);
-
-    // Handle referral code
+    // Handle referral
     let referredBy = null;
     if (referralCode) {
-      const referrer = await User.findOne({ 'referral.code': referralCode });
+      const referrer = await User.findOne({ referralCode });
       if (referrer) {
         referredBy = referrer._id;
       }
     }
 
-    // Create user
-    const user = await User.create({
-      firstName: sanitizedFirstName,
-      lastName: sanitizedLastName,
-      email: sanitizedEmail,
-      phone: sanitizedPhone,
-      password: hashedPassword,
+    // Create new user
+    const user = new User({
+      firstName,
+      lastName,
+      email: email.toLowerCase(),
+      password,
+      phone,
+      dateOfBirth,
+      gender,
       role,
-      emailVerificationToken: hashedEmailToken,
-      emailVerificationExpires: Date.now() + 24 * 60 * 60 * 1000, // 24 hours
-      referral: {
-        referredBy,
-        code: `REF${Date.now()}${Math.random().toString(36).substr(2, 9).toUpperCase()}`
-      },
+      referredBy,
       preferences: {
         notifications: {
           email: {
-            promotions: marketingEmails || false
+            orderUpdates: true,
+            promotions: role === 'customer',
+            securityAlerts: true,
+            newsletter: false
+          },
+          sms: {
+            orderUpdates: true,
+            promotions: false,
+            securityAlerts: true
+          },
+          push: {
+            orderUpdates: true,
+            promotions: false
           }
         }
       }
     });
 
-    // Create cart for user
-    await Cart.create({
-      user: user._id,
-      metadata: {
-        createdFrom: 'registration'
-      }
+    await user.save();
+
+    // Create welcome notification
+    await Notification.createNotification(user._id, {
+      type: 'account',
+      category: 'informational',
+      title: 'Welcome to our platform!',
+      message: `Welcome ${user.firstName}! Your account has been created successfully.`,
+      priority: 'normal',
+      actions: [
+        {
+          type: 'link',
+          label: 'Complete Profile',
+          url: '/profile',
+          action: 'complete_profile'
+        }
+      ]
     });
 
+    // Handle referral rewards
+    if (referredBy) {
+      await this.processReferralReward(referrer._id, user._id);
+    }
+
     // Generate tokens
-    const token = generateToken(user._id, user.email, user.role);
-    const refreshToken = generateRefreshToken(user._id);
+    const token = user.generateAuthToken();
+    const refreshToken = user.generateRefreshToken();
 
-    // Send verification email
-    try {
-      await sendEmail({
-        to: user.email,
-        subject: 'Verify Your Email Address',
-        template: 'emailVerification',
-        data: {
-          firstName: user.firstName,
-          verificationUrl: `${process.env.FRONTEND_URL}/verify-email/${emailVerificationToken}`,
-          expiresIn: '24 hours'
-        }
-      });
-    } catch (emailError) {
-      console.error('Failed to send verification email:', emailError);
-      // Don't fail registration if email fails
-    }
+    // Set refresh token in HTTP-only cookie
+    res.cookie('refreshToken', refreshToken, {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: 'strict',
+      maxAge: 7 * 24 * 60 * 60 * 1000 // 7 days
+    });
 
-    // Send welcome SMS if phone provided
-    if (sanitizedPhone) {
-      try {
-        await sendSMS({
-          to: sanitizedPhone,
-          message: `Welcome to our platform, ${user.firstName}! Your account has been created successfully.`
-        });
-      } catch (smsError) {
-        console.error('Failed to send welcome SMS:', smsError);
-      }
-    }
+    // Log registration
+    logger.info('User registered', {
+      userId: user._id,
+      email: user.email,
+      role: user.role,
+      ip: req.ip,
+      userAgent: req.get('User-Agent')
+    });
 
     res.status(201).json({
       success: true,
-      message: 'Registration successful! Please check your email to verify your account.',
+      message: 'User registered successfully',
       data: {
-        user: {
-          id: user._id,
-          firstName: user.firstName,
-          lastName: user.lastName,
-          email: user.email,
-          role: user.role,
-          emailVerified: user.emailVerified,
-          status: user.status
-        },
+        user: user.getPublicProfile(),
         token,
         refreshToken
       }
     });
+  });
 
-  } catch (error) {
-    console.error('Registration error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Registration failed. Please try again.'
-    });
-  }
-};
+  // Login user
+  login = catchAsync(async (req, res) => {
+    const { email, password } = req.body;
 
-// @desc    Login user
-// @route   POST /api/users/login
-// @access  Public
-const loginUser = async (req, res) => {
-  try {
-    const { email, password, rememberMe = false } = req.body;
+    // Validate input
+    if (!email || !password) {
+      throw new AppError('Email and password are required', 400, true, 'MISSING_CREDENTIALS');
+    }
 
-    // Rate limiting
-    authRateLimit(5, 15 * 60 * 1000)(req, res, async () => {
-      // Validate required fields
-      if (!email || !password) {
-        return res.status(400).json({
-          success: false,
-          error: 'Please provide email and password'
-        });
-      }
-
-      // Sanitize inputs
-      const sanitizedEmail = sanitizeInput(email).toLowerCase();
-
-      // Validate email format
-      if (!isValidEmail(sanitizedEmail)) {
-        return res.status(400).json({
-          success: false,
-          error: 'Please provide a valid email address'
-        });
-      }
-
-      // Find user
-      const user = await User.findByEmailOrPhone(sanitizedEmail).select('+password');
-
-      if (!user) {
-        return res.status(401).json({
-          success: false,
-          error: 'Invalid credentials'
-        });
-      }
-
-      // Check if account is locked
-      if (user.isLocked()) {
-        return res.status(423).json({
-          success: false,
-          error: 'Account is locked due to too many failed login attempts. Please contact support.'
-        });
-      }
-
-      // Check password
-      const isPasswordValid = await comparePassword(password, user.password);
-
-      if (!isPasswordValid) {
-        // Increment failed attempts
-        await user.incrementLoginAttempts();
-        return res.status(401).json({
-          success: false,
-          error: 'Invalid credentials'
-        });
-      }
-
-      // Check if user needs verification
-      if (!user.emailVerified) {
-        return res.status(403).json({
-          success: false,
-          error: 'Please verify your email address before logging in',
-          requiresVerification: true
-        });
-      }
-
-      // Check if account is active
-      if (user.status !== 'active') {
-        return res.status(403).json({
-          success: false,
-          error: 'Your account is not active. Please contact support.'
-        });
-      }
-
-      // Reset failed login attempts
-      await user.resetLoginAttempts();
-
-      // Update last login
-      await user.updateLastLogin();
-
-      // Update device info
-      const deviceInfo = {
-        deviceId: req.headers['user-agent'] ? require('crypto').createHash('md5').update(req.headers['user-agent']).digest('hex') : 'unknown',
-        deviceType: getDeviceType(req.headers['user-agent']),
-        browser: getBrowser(req.headers['user-agent']),
-        ipAddress: req.ip || req.connection.remoteAddress,
-        location: await getLocationFromIP(req.ip),
-        lastSeen: new Date()
-      };
-
-      user.deviceInfo.push(deviceInfo);
-      await user.save();
-
-      // Generate tokens
-      const token = generateToken(user._id, user.email, user.role);
-      const refreshToken = generateRefreshToken(user._id);
-
-      // Set refresh token as httpOnly cookie if remember me
-      if (rememberMe) {
-        res.cookie('refreshToken', refreshToken, {
-          httpOnly: true,
-          secure: process.env.NODE_ENV === 'production',
-          sameSite: 'strict',
-          maxAge: 7 * 24 * 60 * 60 * 1000 // 7 days
-        });
-      }
-
-      res.json({
-        success: true,
-        message: 'Login successful',
-        data: {
-          user: {
-            id: user._id,
-            firstName: user.firstName,
-            lastName: user.lastName,
-            email: user.email,
-            phone: user.phone,
-            role: user.role,
-            emailVerified: user.emailVerified,
-            phoneVerified: user.phoneVerified,
-            status: user.status,
-            profile: user.profile,
-            preferences: user.preferences,
-            shopping: user.shopping,
-            subscription: user.subscription
-          },
-          token,
-          refreshToken: rememberMe ? undefined : refreshToken,
-          statistics: user.getStatistics()
-        }
-      });
-    });
-
-  } catch (error) {
-    console.error('Login error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Login failed. Please try again.'
-    });
-  }
-};
-
-// @desc    Get current user profile
-// @route   GET /api/users/profile
-// @access  Private
-const getUserProfile = async (req, res) => {
-  try {
-    const user = await User.findById(req.user._id)
-      .populate('shopping.favoriteCategories', 'name slug')
-      .populate('shopping.favoriteVendors', 'firstName lastName businessName')
-      .populate('vendorProfile');
+    // Find user and include password
+    const user = await User.findOne({ email: email.toLowerCase() }).select('+password');
 
     if (!user) {
-      return res.status(404).json({
-        success: false,
-        error: 'User not found'
-      });
+      throw new AppError('Invalid email or password', 401, true, 'INVALID_CREDENTIALS');
     }
 
-    // Get user's recent orders
-    const recentOrders = await require('../models/Order').find({ user: user._id })
-      .sort({ createdAt: -1 })
-      .limit(5)
-      .select('orderNumber status totalAmount createdAt');
-
-    // Get user's wishlist count
-    const wishlistCount = user.shopping.wishList.length;
-
-    // Get user's cart summary
-    const cart = await Cart.findByUser(user._id);
-    const cartSummary = cart ? cart.getCartValue() : { itemCount: 0, total: 0 };
-
-    res.json({
-      success: true,
-      data: {
-        user: {
-          id: user._id,
-          firstName: user.firstName,
-          lastName: user.lastName,
-          email: user.email,
-          phone: user.phone,
-          role: user.role,
-          status: user.status,
-          emailVerified: user.emailVerified,
-          phoneVerified: user.phoneVerified,
-          profile: user.profile,
-          addresses: user.addresses,
-          preferences: user.preferences,
-          shopping: {
-            ...user.shopping.toObject(),
-            wishList: undefined, // Don't send full wishlist
-            recentlyViewed: undefined // Don't send full recently viewed
-          },
-          vendorProfile: user.role === 'vendor' ? user.vendorProfile : undefined,
-          subscription: user.subscription,
-          referral: user.referral,
-          statistics: user.getStatistics()
-        },
-        recentOrders,
-        wishlistCount,
-        cartSummary,
-        lastLogin: user.lastLogin,
-        memberSince: user.createdAt
-      }
-    });
-
-  } catch (error) {
-    console.error('Get profile error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Failed to fetch profile'
-    });
-  }
-};
-
-// @desc    Update user profile
-// @route   PUT /api/users/profile
-// @access  Private
-const updateUserProfile = async (req, res) => {
-  try {
-    const updates = req.body;
-    const userId = req.user._id;
-
-    // Fields that can be updated
-    const allowedUpdates = [
-      'firstName', 'lastName', 'phone', 'profile.bio', 'profile.dateOfBirth',
-      'profile.gender', 'profile.website', 'preferences.language', 'preferences.currency',
-      'preferences.timezone', 'preferences.notifications', 'preferences.privacy'
-    ];
-
-    // Filter updates to only allowed fields
-    const filteredUpdates = {};
-    Object.keys(updates).forEach(key => {
-      if (allowedUpdates.includes(key)) {
-        filteredUpdates[key] = sanitizeInput(updates[key]);
-      }
-    });
-
-    // Validate phone if provided
-    if (filteredUpdates.phone && !isValidPhone(filteredUpdates.phone)) {
-      return res.status(400).json({
-        success: false,
-        error: 'Please provide a valid phone number'
-      });
+    // Check if account is locked
+    if (user.isLocked()) {
+      throw new AppError('Account temporarily locked due to too many failed attempts', 423, true, 'ACCOUNT_LOCKED');
     }
 
-    // Validate website if provided
-    if (filteredUpdates['profile.website']) {
-      const websiteRegex = /^https?:\/\/.+/;
-      if (!websiteRegex.test(filteredUpdates['profile.website'])) {
-        return res.status(400).json({
-          success: false,
-          error: 'Please provide a valid website URL'
-        });
-      }
+    // Check password
+    const isPasswordCorrect = await user.comparePassword(password);
+
+    if (!isPasswordCorrect) {
+      await user.incrementLoginAttempts();
+      throw new AppError('Invalid email or password', 401, true, 'INVALID_CREDENTIALS');
     }
 
-    // Update user
-    const user = await User.findByIdAndUpdate(
-      userId,
-      { $set: filteredUpdates },
-      { new: true, runValidators: true }
+    // Reset login attempts on successful login
+    await user.resetLoginAttempts();
+
+    // Add login history
+    await user.addLoginHistory(
+      req.ip,
+      req.get('User-Agent'),
+      'Unknown', // Location would be determined here
+      true
     );
 
-    if (!user) {
-      return res.status(404).json({
-        success: false,
-        error: 'User not found'
-      });
-    }
-
-    res.json({
-      success: true,
-      message: 'Profile updated successfully',
-      data: {
-        user: {
-          id: user._id,
-          firstName: user.firstName,
-          lastName: user.lastName,
-          email: user.email,
-          phone: user.phone,
-          profile: user.profile,
-          preferences: user.preferences
-        }
-      }
-    });
-
-  } catch (error) {
-    console.error('Update profile error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Failed to update profile'
-    });
-  }
-};
-
-// @desc    Change password
-// @route   PUT /api/users/change-password
-// @access  Private
-const changePassword = async (req, res) => {
-  try {
-    const { currentPassword, newPassword, confirmPassword } = req.body;
-    const userId = req.user._id;
-
-    // Validate required fields
-    if (!currentPassword || !newPassword || !confirmPassword) {
-      return res.status(400).json({
-        success: false,
-        error: 'Please provide current password, new password, and confirmation'
-      });
-    }
-
-    // Validate password strength
-    if (newPassword.length < 8) {
-      return res.status(400).json({
-        success: false,
-        error: 'New password must be at least 8 characters long'
-      });
-    }
-
-    if (newPassword !== confirmPassword) {
-      return res.status(400).json({
-        success: false,
-        error: 'New passwords do not match'
-      });
-    }
-
-    // Get user with password
-    const user = await User.findById(userId).select('+password');
-
-    if (!user) {
-      return res.status(404).json({
-        success: false,
-        error: 'User not found'
-      });
-    }
-
-    // Verify current password
-    const isCurrentPasswordValid = await comparePassword(currentPassword, user.password);
-
-    if (!isCurrentPasswordValid) {
-      return res.status(400).json({
-        success: false,
-        error: 'Current password is incorrect'
-      });
-    }
-
-    // Hash new password
-    const hashedNewPassword = await hashPassword(newPassword);
-
-    // Update password
-    user.password = hashedNewPassword;
-    user.security.passwordChangedAt = Date.now();
+    // Update last login
+    user.lastLogin = new Date();
+    user.lastLoginIP = req.ip;
     await user.save();
 
-    // Invalidate all refresh tokens (force re-login)
-    // This would typically involve clearing refresh tokens from database
+    // Generate tokens
+    const token = user.generateAuthToken();
+    const refreshToken = user.generateRefreshToken();
 
-    res.json({
+    // Set refresh token in HTTP-only cookie
+    res.cookie('refreshToken', refreshToken, {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: 'strict',
+      maxAge: 7 * 24 * 60 * 60 * 1000
+    });
+
+    // Send welcome back notification if user hasn't logged in recently
+    const daysSinceLastLogin = user.lastLogin ?
+      Math.floor((Date.now() - user.lastLogin) / (1000 * 60 * 60 * 24)) : 999;
+
+    if (daysSinceLastLogin > 7) {
+      await Notification.createNotification(user._id, {
+        type: 'account',
+        category: 'informational',
+        title: 'Welcome back!',
+        message: `Welcome back ${user.firstName}! It's been ${daysSinceLastLogin} days since your last visit.`,
+        priority: 'low'
+      });
+    }
+
+    logger.info('User logged in', {
+      userId: user._id,
+      email: user.email,
+      role: user.role,
+      ip: req.ip
+    });
+
+    res.status(200).json({
       success: true,
-      message: 'Password changed successfully. Please login again with your new password.'
+      message: 'Login successful',
+      data: {
+        user: user.getPublicProfile(),
+        token,
+        refreshToken
+      }
+    });
+  });
+
+  // Logout user
+  logout = catchAsync(async (req, res) => {
+    // Clear refresh token cookie
+    res.clearCookie('refreshToken');
+
+    // Add logout history
+    await req.user.addLoginHistory(
+      req.ip,
+      req.get('User-Agent'),
+      'Unknown',
+      true
+    );
+
+    logger.info('User logged out', {
+      userId: req.user._id,
+      email: req.user.email
     });
 
-  } catch (error) {
-    console.error('Change password error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Failed to change password'
+    res.status(200).json({
+      success: true,
+      message: 'Logout successful'
     });
-  }
-};
+  });
 
-// @desc    Forgot password
-// @route   POST /api/users/forgot-password
-// @access  Public
-const forgotPassword = async (req, res) => {
-  try {
+  // Refresh access token
+  refreshToken = catchAsync(async (req, res) => {
+    const { refreshToken } = req.cookies;
+
+    if (!refreshToken) {
+      throw new AppError('Refresh token not provided', 401, true, 'NO_REFRESH_TOKEN');
+    }
+
+    try {
+      // Verify refresh token
+      const decoded = jwt.verify(refreshToken, process.env.JWT_REFRESH_SECRET);
+
+      // Find user
+      const user = await User.findById(decoded.id);
+
+      if (!user) {
+        throw new AppError('User not found', 401, true, 'USER_NOT_FOUND');
+      }
+
+      // Generate new tokens
+      const newToken = user.generateAuthToken();
+      const newRefreshToken = user.generateRefreshToken();
+
+      // Set new refresh token
+      res.cookie('refreshToken', newRefreshToken, {
+        httpOnly: true,
+        secure: process.env.NODE_ENV === 'production',
+        sameSite: 'strict',
+        maxAge: 7 * 24 * 60 * 60 * 1000
+      });
+
+      res.status(200).json({
+        success: true,
+        message: 'Token refreshed successfully',
+        data: {
+          token: newToken,
+          refreshToken: newRefreshToken
+        }
+      });
+    } catch (error) {
+      throw new AppError('Invalid refresh token', 401, true, 'INVALID_REFRESH_TOKEN');
+    }
+  });
+
+  // Forgot password
+  forgotPassword = catchAsync(async (req, res) => {
     const { email } = req.body;
 
-    if (!email) {
-      return res.status(400).json({
-        success: false,
-        error: 'Please provide your email address'
-      });
-    }
-
-    const sanitizedEmail = sanitizeInput(email).toLowerCase();
-
-    if (!isValidEmail(sanitizedEmail)) {
-      return res.status(400).json({
-        success: false,
-        error: 'Please provide a valid email address'
-      });
-    }
-
-    const user = await User.findOne({ email: sanitizedEmail });
+    const user = await User.findOne({ email: email.toLowerCase() });
 
     if (!user) {
-      // Don't reveal if email exists or not
-      return res.json({
+      // Don't reveal that user doesn't exist
+      return res.status(200).json({
         success: true,
-        message: 'If an account with that email exists, we have sent a password reset link.'
+        message: 'If an account with that email exists, a password reset link has been sent'
       });
     }
 
     // Generate reset token
-    const resetToken = generatePasswordResetToken();
-    const hashedResetToken = hashToken(resetToken);
-
-    // Save reset token to user
-    user.passwordResetToken = hashedResetToken;
-    user.passwordResetExpires = Date.now() + 10 * 60 * 1000; // 10 minutes
+    const resetToken = user.createPasswordResetToken();
     await user.save();
 
     // Send reset email
+    const resetUrl = `${process.env.CLIENT_URL}/reset-password/${resetToken}`;
+
     try {
-      await sendEmail({
+      await emailTransporter.sendMail({
+        from: process.env.EMAIL_FROM,
         to: user.email,
         subject: 'Password Reset Request',
-        template: 'passwordReset',
-        data: {
-          firstName: user.firstName,
-          resetUrl: `${process.env.FRONTEND_URL}/reset-password/${resetToken}`,
-          expiresIn: '10 minutes'
-        }
+        html: `
+          <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+            <h2>Password Reset Request</h2>
+            <p>Hello ${user.firstName},</p>
+            <p>You have requested to reset your password. Click the link below to reset it:</p>
+            <p><a href="${resetUrl}" style="background: #007bff; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px;">Reset Password</a></p>
+            <p>If you didn't request this, please ignore this email.</p>
+            <p>This link will expire in 10 minutes.</p>
+            <p>Best regards,<br>The Team</p>
+          </div>
+        `
       });
 
-      res.json({
+      logger.info('Password reset email sent', { userId: user._id, email: user.email });
+
+      res.status(200).json({
         success: true,
         message: 'Password reset link sent to your email'
       });
+    } catch (error) {
+      // Reset token if email fails
+      user.passwordResetToken = undefined;
+      user.passwordResetExpires = undefined;
+      await user.save();
 
-    } catch (emailError) {
-      console.error('Failed to send reset email:', emailError);
-      res.status(500).json({
-        success: false,
-        error: 'Failed to send reset email. Please try again.'
-      });
+      logger.error('Failed to send password reset email', { userId: user._id, error: error.message });
+
+      throw new AppError('Failed to send reset email', 500, false, 'EMAIL_SEND_FAILED');
     }
+  });
 
-  } catch (error) {
-    console.error('Forgot password error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Failed to process password reset request'
-    });
-  }
-};
+  // Reset password
+  resetPassword = catchAsync(async (req, res) => {
+    const { token, password } = req.body;
 
-// @desc    Reset password
-// @route   PUT /api/users/reset-password/:token
-// @access  Public
-const resetPassword = async (req, res) => {
-  try {
-    const { token } = req.params;
-    const { password, confirmPassword } = req.body;
+    // Hash token to compare
+    const hashedToken = crypto.createHash('sha256').update(token).digest('hex');
 
-    if (!token) {
-      return res.status(400).json({
-        success: false,
-        error: 'Reset token is required'
-      });
-    }
-
-    if (!password || !confirmPassword) {
-      return res.status(400).json({
-        success: false,
-        error: 'Please provide new password and confirmation'
-      });
-    }
-
-    if (password !== confirmPassword) {
-      return res.status(400).json({
-        success: false,
-        error: 'Passwords do not match'
-      });
-    }
-
-    if (password.length < 8) {
-      return res.status(400).json({
-        success: false,
-        error: 'Password must be at least 8 characters long'
-      });
-    }
-
-    // Hash the token to compare with stored hash
-    const hashedToken = hashToken(token);
-
-    // Find user with valid reset token
     const user = await User.findOne({
       passwordResetToken: hashedToken,
       passwordResetExpires: { $gt: Date.now() }
     });
 
     if (!user) {
-      return res.status(400).json({
-        success: false,
-        error: 'Invalid or expired reset token'
-      });
+      throw new AppError('Invalid or expired reset token', 400, true, 'INVALID_RESET_TOKEN');
     }
 
-    // Hash new password
-    const hashedPassword = await hashPassword(password);
-
-    // Update user
-    user.password = hashedPassword;
+    // Set new password
+    user.password = password;
     user.passwordResetToken = undefined;
     user.passwordResetExpires = undefined;
-    user.security.passwordChangedAt = Date.now();
+    user.passwordResetAttempts = 0;
     await user.save();
 
-    res.json({
+    // Send confirmation email
+    await emailTransporter.sendMail({
+      from: process.env.EMAIL_FROM,
+      to: user.email,
+      subject: 'Password Reset Successful',
+      html: `
+        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+          <h2>Password Reset Successful</h2>
+          <p>Hello ${user.firstName},</p>
+          <p>Your password has been successfully reset. You can now log in with your new password.</p>
+          <p>If you didn't make this change, please contact support immediately.</p>
+          <p>Best regards,<br>The Team</p>
+        </div>
+      `
+    });
+
+    logger.info('Password reset successful', { userId: user._id });
+
+    res.status(200).json({
       success: true,
-      message: 'Password reset successfully'
+      message: 'Password reset successful'
+    });
+  });
+
+  // Change password
+  changePassword = catchAsync(async (req, res) => {
+    const { currentPassword, newPassword } = req.body;
+
+    const user = await User.findById(req.user.id).select('+password');
+
+    // Check current password
+    const isCurrentPasswordCorrect = await user.comparePassword(currentPassword);
+
+    if (!isCurrentPasswordCorrect) {
+      throw new AppError('Current password is incorrect', 400, true, 'INVALID_CURRENT_PASSWORD');
+    }
+
+    // Update password
+    user.password = newPassword;
+    await user.save();
+
+    // Send confirmation email
+    await emailTransporter.sendMail({
+      from: process.env.EMAIL_FROM,
+      to: user.email,
+      subject: 'Password Changed',
+      html: `
+        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+          <h2>Password Changed</h2>
+          <p>Hello ${user.firstName},</p>
+          <p>Your password has been successfully changed.</p>
+          <p>If you didn't make this change, please contact support immediately.</p>
+          <p>Best regards,<br>The Team</p>
+        </div>
+      `
     });
 
-  } catch (error) {
-    console.error('Reset password error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Failed to reset password'
+    logger.info('Password changed', { userId: user._id });
+
+    res.status(200).json({
+      success: true,
+      message: 'Password changed successfully'
     });
-  }
-};
+  });
 
-// @desc    Verify email
-// @route   GET /api/users/verify-email/:token
-// @access  Public
-const verifyEmail = async (req, res) => {
-  try {
-    const { token } = req.params;
+  // ===============================
+  // TWO-FACTOR AUTHENTICATION
+  // ===============================
 
-    if (!token) {
+  // Enable 2FA
+  enableTwoFactor = catchAsync(async (req, res) => {
+    const user = await User.findById(req.user.id);
+
+    if (user.twoFactorEnabled) {
+      throw new AppError('2FA is already enabled', 400, true, 'TWO_FA_ALREADY_ENABLED');
+    }
+
+    // Generate 2FA secret
+    const secret = user.generateTwoFactorSecret();
+
+    // Generate QR code URL
+    const serviceName = process.env.APP_NAME || 'E-commerce';
+    const qrCodeUrl = `otpauth://totp/${serviceName}:${user.email}?secret=${secret.base32}&issuer=${serviceName}`;
+
+    await user.save();
+
+    res.status(200).json({
+      success: true,
+      message: '2FA setup initiated',
+      data: {
+        secret: secret.base32,
+        qrCodeUrl,
+        manualEntryKey: secret.base32
+      }
+    });
+  });
+
+  // Verify and enable 2FA
+  verifyTwoFactor = catchAsync(async (req, res) => {
+    const { token } = req.body;
+
+    const user = await User.findById(req.user.id).select('+twoFactorSecret');
+
+    if (!user.twoFactorSecret) {
+      throw new AppError('2FA setup not initiated', 400, true, 'TWO_FA_NOT_INITIATED');
+    }
+
+    // Verify token
+    const isValid = user.verifyTwoFactorToken(token);
+
+    if (!isValid) {
+      throw new AppError('Invalid verification code', 400, true, 'INVALID_TWO_FA_TOKEN');
+    }
+
+    // Enable 2FA
+    user.twoFactorEnabled = true;
+    await user.save();
+
+    // Generate backup codes
+    const backupCodes = user.generateBackupCodes();
+
+    // Send confirmation email
+    await emailTransporter.sendMail({
+      from: process.env.EMAIL_FROM,
+      to: user.email,
+      subject: 'Two-Factor Authentication Enabled',
+      html: `
+        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+          <h2>Two-Factor Authentication Enabled</h2>
+          <p>Hello ${user.firstName},</p>
+          <p>Two-factor authentication has been successfully enabled for your account.</p>
+          <p><strong>Important:</strong> Please save your backup codes in a safe place:</p>
+          <ul>
+            ${backupCodes.map(code => `<li><code>${code}</code></li>`).join('')}
+          </ul>
+          <p>You can use these codes to access your account if you lose your device.</p>
+          <p>Best regards,<br>The Team</p>
+        </div>
+      `
+    });
+
+    logger.info('2FA enabled', { userId: user._id });
+
+    res.status(200).json({
+      success: true,
+      message: '2FA enabled successfully',
+      data: {
+        backupCodes
+      }
+    });
+  });
+
+  // Disable 2FA
+  disableTwoFactor = catchAsync(async (req, res) => {
+    const { password, token } = req.body;
+
+    const user = await User.findById(req.user.id).select('+password +twoFactorSecret');
+
+    // Verify password
+    const isPasswordCorrect = await user.comparePassword(password);
+    if (!isPasswordCorrect) {
+      throw new AppError('Password is incorrect', 400, true, 'INVALID_PASSWORD');
+    }
+
+    // Verify 2FA token if enabled
+    if (user.twoFactorEnabled && user.twoFactorSecret) {
+      const isTokenValid = user.verifyTwoFactorToken(token);
+      if (!isTokenValid) {
+        throw new AppError('Invalid 2FA token', 400, true, 'INVALID_TWO_FA_TOKEN');
+      }
+    }
+
+    // Disable 2FA
+    user.twoFactorEnabled = false;
+    user.twoFactorSecret = undefined;
+    user.twoFactorBackupCodes = [];
+    await user.save();
+
+    // Send confirmation email
+    await emailTransporter.sendMail({
+      from: process.env.EMAIL_FROM,
+      to: user.email,
+      subject: 'Two-Factor Authentication Disabled',
+      html: `
+        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+          <h2>Two-Factor Authentication Disabled</h2>
+          <p>Hello ${user.firstName},</p>
+          <p>Two-factor authentication has been disabled for your account.</p>
+          <p>If you didn't make this change, please contact support immediately.</p>
+          <p>Best regards,<br>The Team</p>
+        </div>
+      `
+    });
+
+    logger.info('2FA disabled', { userId: user._id });
+
+    res.status(200).json({
+      success: true,
+      message: '2FA disabled successfully'
+    });
+  });
+
+  // ===============================
+  // USER PROFILE MANAGEMENT
+  // ===============================
+
+  // Get user profile
+  getProfile = catchAsync(async (req, res) => {
+    const user = await User.findById(req.user.id)
+      .populate('referredBy', 'firstName lastName')
+      .populate('referrals.user', 'firstName lastName email');
+
+    if (!user) {
+      throw new AppError('User not found', 404, true, 'USER_NOT_FOUND');
+    }
+
+    res.status(200).json({
+      success: true,
+      data: {
+        profile: user.getPublicProfile(),
+        stats: {
+          totalOrders: user.totalOrders,
+          totalSpent: user.totalSpent,
+          loyaltyPoints: user.customerProfile?.loyaltyPoints || 0,
+          membershipTier: user.customerProfile?.membershipTier || 'bronze',
+          accountAge: user.accountAge,
+          activityScore: user.activityScore
+        },
+        preferences: user.preferences,
+        security: {
+          twoFactorEnabled: user.twoFactorEnabled,
+          emailVerified: user.isEmailVerified,
+          phoneVerified: user.isPhoneVerified,
+          lastLogin: user.lastLogin,
+          loginAttempts: user.loginAttempts
+        }
+      }
+    });
+  });
+
+  // Update user profile
+  updateProfile = catchAsync(async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
       return res.status(400).json({
-        success: false,
-        error: 'Verification token is required'
+        error: 'Validation failed',
+        details: errors.array()
       });
     }
 
-    // Hash the token to compare with stored hash
-    const hashedToken = hashToken(token);
+    const allowedFields = [
+      'firstName', 'lastName', 'phone', 'dateOfBirth', 'gender',
+      'bio', 'website', 'socialLinks', 'timezone', 'language', 'currency'
+    ];
 
-    // Find user with valid verification token
+    const updates = {};
+    allowedFields.forEach(field => {
+      if (req.body[field] !== undefined) {
+        updates[field] = req.body[field];
+      }
+    });
+
+    // Handle address update
+    if (req.body.address) {
+      updates.address = req.body.address;
+    }
+
+    const user = await User.findByIdAndUpdate(
+      req.user.id,
+      { ...updates, updatedAt: new Date() },
+      { new: true, runValidators: true }
+    );
+
+    if (!user) {
+      throw new AppError('User not found', 404, true, 'USER_NOT_FOUND');
+    }
+
+    // Recalculate activity score
+    await user.calculateActivityScore();
+
+    logger.info('User profile updated', { userId: user._id });
+
+    res.status(200).json({
+      success: true,
+      message: 'Profile updated successfully',
+      data: user.getPublicProfile()
+    });
+  });
+
+  // Update user avatar
+  updateAvatar = catchAsync(async (req, res) => {
+    if (!req.file) {
+      throw new AppError('No image file provided', 400, true, 'NO_IMAGE_FILE');
+    }
+
+    const user = await User.findById(req.user.id);
+
+    // Delete old avatar from Cloudinary if exists
+    if (user.avatar && user.avatar.public_id) {
+      await cloudinary.uploader.destroy(user.avatar.public_id);
+    }
+
+    // Upload new avatar
+    const result = await cloudinary.uploader.upload(req.file.path, {
+      folder: 'avatars',
+      width: 300,
+      height: 300,
+      crop: 'fill',
+      quality: 'auto'
+    });
+
+    user.avatar = {
+      public_id: result.public_id,
+      url: result.secure_url,
+      thumbnail: result.secure_url.replace('/upload/', '/upload/w_150,h_150,c_fill/')
+    };
+
+    await user.save();
+
+    // Recalculate activity score
+    await user.calculateActivityScore();
+
+    logger.info('User avatar updated', { userId: user._id });
+
+    res.status(200).json({
+      success: true,
+      message: 'Avatar updated successfully',
+      data: {
+        avatar: user.avatar
+      }
+    });
+  });
+
+  // Delete user account
+  deleteAccount = catchAsync(async (req, res) => {
+    const { password, reason } = req.body;
+
+    const user = await User.findById(req.user.id).select('+password');
+
+    // Verify password
+    const isPasswordCorrect = await user.comparePassword(password);
+    if (!isPasswordCorrect) {
+      throw new AppError('Password is incorrect', 400, true, 'INVALID_PASSWORD');
+    }
+
+    // Soft delete user
+    user.isDeleted = true;
+    user.deletedAt = new Date();
+    user.deletedBy = user._id;
+    await user.save();
+
+    // Cancel active subscriptions
+    await this.cancelUserSubscriptions(user._id);
+
+    // Anonymize user data
+    await this.anonymizeUserData(user._id);
+
+    // Send confirmation email
+    await emailTransporter.sendMail({
+      from: process.env.EMAIL_FROM,
+      to: user.email,
+      subject: 'Account Deletion Confirmed',
+      html: `
+        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+          <h2>Account Deletion Confirmed</h2>
+          <p>Hello ${user.firstName},</p>
+          <p>Your account has been successfully deleted.</p>
+          <p>Reason: ${reason || 'Not provided'}</p>
+          <p>If you change your mind, you can contact support within 30 days to restore your account.</p>
+          <p>Best regards,<br>The Team</p>
+        </div>
+      `
+    });
+
+    logger.info('User account deleted', { userId: user._id, reason });
+
+    res.status(200).json({
+      success: true,
+      message: 'Account deleted successfully'
+    });
+  });
+
+  // ===============================
+  // EMAIL & PHONE VERIFICATION
+  // ===============================
+
+  // Send email verification
+  sendEmailVerification = catchAsync(async (req, res) => {
+    const user = await User.findById(req.user.id);
+
+    if (user.isEmailVerified) {
+      throw new AppError('Email already verified', 400, true, 'EMAIL_ALREADY_VERIFIED');
+    }
+
+    // Generate verification token
+    const verificationToken = user.createEmailVerificationToken();
+    await user.save();
+
+    // Send verification email
+    const verificationUrl = `${process.env.CLIENT_URL}/verify-email/${verificationToken}`;
+
+    await emailTransporter.sendMail({
+      from: process.env.EMAIL_FROM,
+      to: user.email,
+      subject: 'Verify Your Email Address',
+      html: `
+        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+          <h2>Verify Your Email Address</h2>
+          <p>Hello ${user.firstName},</p>
+          <p>Please click the link below to verify your email address:</p>
+          <p><a href="${verificationUrl}" style="background: #007bff; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px;">Verify Email</a></p>
+          <p>If you didn't create an account, please ignore this email.</p>
+          <p>This link will expire in 24 hours.</p>
+          <p>Best regards,<br>The Team</p>
+        </div>
+      `
+    });
+
+    logger.info('Email verification sent', { userId: user._id });
+
+    res.status(200).json({
+      success: true,
+      message: 'Verification email sent'
+    });
+  });
+
+  // Verify email
+  verifyEmail = catchAsync(async (req, res) => {
+    const { token } = req.params;
+
+    const hashedToken = crypto.createHash('sha256').update(token).digest('hex');
+
     const user = await User.findOne({
       emailVerificationToken: hashedToken,
       emailVerificationExpires: { $gt: Date.now() }
     });
 
     if (!user) {
-      return res.status(400).json({
-        success: false,
-        error: 'Invalid or expired verification token'
-      });
+      throw new AppError('Invalid or expired verification token', 400, true, 'INVALID_VERIFICATION_TOKEN');
     }
 
-    // Update user verification status
-    user.emailVerified = true;
-    user.status = 'active';
+    user.isEmailVerified = true;
     user.emailVerificationToken = undefined;
     user.emailVerificationExpires = undefined;
     await user.save();
 
+    // Add loyalty points for email verification
+    await user.addLoyaltyPoints(50, 'Email verification');
+
     // Send welcome email
-    try {
-      await sendEmail({
-        to: user.email,
-        subject: 'Welcome to Our Platform!',
-        template: 'welcome',
-        data: {
-          firstName: user.firstName,
-          loginUrl: `${process.env.FRONTEND_URL}/login`
-        }
-      });
-    } catch (emailError) {
-      console.error('Failed to send welcome email:', emailError);
-    }
+    await emailTransporter.sendMail({
+      from: process.env.EMAIL_FROM,
+      to: user.email,
+      subject: 'Welcome! Email Verified',
+      html: `
+        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+          <h2>Welcome! Email Verified</h2>
+          <p>Hello ${user.firstName},</p>
+          <p>Your email has been successfully verified. Thank you for joining us!</p>
+          <p>You've earned 50 loyalty points for verifying your email.</p>
+          <p>Best regards,<br>The Team</p>
+        </div>
+      `
+    });
 
-    res.json({
+    logger.info('Email verified', { userId: user._id });
+
+    res.status(200).json({
       success: true,
-      message: 'Email verified successfully! Your account is now active.'
+      message: 'Email verified successfully'
     });
+  });
 
-  } catch (error) {
-    console.error('Verify email error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Failed to verify email'
-    });
-  }
-};
+  // Send phone verification
+  sendPhoneVerification = catchAsync(async (req, res) => {
+    const user = await User.findById(req.user.id);
 
-// @desc    Resend verification email
-// @route   POST /api/users/resend-verification
-// @access  Public
-const resendVerification = async (req, res) => {
-  try {
-    const { email } = req.body;
-
-    if (!email) {
-      return res.status(400).json({
-        success: false,
-        error: 'Please provide your email address'
-      });
+    if (!user.phone) {
+      throw new AppError('Phone number not provided', 400, true, 'NO_PHONE_NUMBER');
     }
 
-    const sanitizedEmail = sanitizeInput(email).toLowerCase();
-
-    if (!isValidEmail(sanitizedEmail)) {
-      return res.status(400).json({
-        success: false,
-        error: 'Please provide a valid email address'
-      });
+    if (user.isPhoneVerified) {
+      throw new AppError('Phone already verified', 400, true, 'PHONE_ALREADY_VERIFIED');
     }
 
-    const user = await User.findOne({ email: sanitizedEmail });
-
-    if (!user) {
-      return res.status(404).json({
-        success: false,
-        error: 'No account found with this email address'
-      });
-    }
-
-    if (user.emailVerified) {
-      return res.status(400).json({
-        success: false,
-        error: 'Email is already verified'
-      });
-    }
-
-    // Check if we can resend (prevent spam)
-    const lastSent = user.updatedAt;
-    const timeDiff = Date.now() - lastSent.getTime();
-    const cooldownPeriod = 5 * 60 * 1000; // 5 minutes
-
-    if (timeDiff < cooldownPeriod) {
-      const remainingTime = Math.ceil((cooldownPeriod - timeDiff) / 1000);
-      return res.status(429).json({
-        success: false,
-        error: `Please wait ${remainingTime} seconds before requesting another verification email`
-      });
-    }
-
-    // Generate new verification token
-    const emailVerificationToken = generateEmailVerificationToken();
-    const hashedEmailToken = hashToken(emailVerificationToken);
-
-    user.emailVerificationToken = hashedEmailToken;
-    user.emailVerificationExpires = Date.now() + 24 * 60 * 60 * 1000; // 24 hours
+    // Generate verification token
+    const verificationToken = user.createPhoneVerificationToken();
     await user.save();
 
-    // Send verification email
+    // Send SMS
     try {
-      await sendEmail({
-        to: user.email,
-        subject: 'Verify Your Email Address',
-        template: 'emailVerification',
-        data: {
-          firstName: user.firstName,
-          verificationUrl: `${process.env.FRONTEND_URL}/verify-email/${emailVerificationToken}`,
-          expiresIn: '24 hours'
-        }
+      await smsClient.messages.create({
+        body: `Your verification code is: ${verificationToken}`,
+        from: process.env.TWILIO_PHONE_NUMBER,
+        to: user.phone
       });
 
-      res.json({
+      logger.info('Phone verification SMS sent', { userId: user._id });
+
+      res.status(200).json({
         success: true,
-        message: 'Verification email sent successfully'
+        message: 'Verification code sent to your phone'
       });
+    } catch (error) {
+      // Reset token if SMS fails
+      user.phoneVerificationToken = undefined;
+      user.phoneVerificationExpires = undefined;
+      await user.save();
 
-    } catch (emailError) {
-      console.error('Failed to send verification email:', emailError);
-      res.status(500).json({
-        success: false,
-        error: 'Failed to send verification email. Please try again.'
+      logger.error('Failed to send phone verification SMS', { userId: user._id, error: error.message });
+
+      throw new AppError('Failed to send verification SMS', 500, false, 'SMS_SEND_FAILED');
+    }
+  });
+
+  // Verify phone
+  verifyPhone = catchAsync(async (req, res) => {
+    const { token } = req.body;
+
+    const user = await User.findById(req.user.id);
+
+    if (!user.phoneVerificationToken) {
+      throw new AppError('Phone verification not initiated', 400, true, 'PHONE_VERIFICATION_NOT_INITIATED');
+    }
+
+    // Hash token to compare
+    const hashedToken = crypto.createHash('sha256').update(token).digest('hex');
+
+    if (user.phoneVerificationToken !== hashedToken) {
+      throw new AppError('Invalid verification code', 400, true, 'INVALID_VERIFICATION_CODE');
+    }
+
+    if (user.phoneVerificationExpires < Date.now()) {
+      throw new AppError('Verification code expired', 400, true, 'EXPIRED_VERIFICATION_CODE');
+    }
+
+    user.isPhoneVerified = true;
+    user.phoneVerificationToken = undefined;
+    user.phoneVerificationExpires = undefined;
+    await user.save();
+
+    // Add loyalty points for phone verification
+    await user.addLoyaltyPoints(25, 'Phone verification');
+
+    logger.info('Phone verified', { userId: user._id });
+
+    res.status(200).json({
+      success: true,
+      message: 'Phone verified successfully'
+    });
+  });
+
+  // ===============================
+  // USER PREFERENCES
+  // ===============================
+
+  // Get user preferences
+  getPreferences = catchAsync(async (req, res) => {
+    const user = await User.findById(req.user.id);
+
+    res.status(200).json({
+      success: true,
+      data: user.preferences
+    });
+  });
+
+  // Update notification preferences
+  updateNotificationPreferences = catchAsync(async (req, res) => {
+    const { notifications } = req.body;
+
+    const user = await User.findByIdAndUpdate(
+      req.user.id,
+      {
+        'preferences.notifications': notifications,
+        updatedAt: new Date()
+      },
+      { new: true }
+    );
+
+    // Update all existing notifications with new preferences
+    await Notification.updateMany(
+      { user: req.user.id },
+      { preferences: user.preferences }
+    );
+
+    logger.info('Notification preferences updated', { userId: user._id });
+
+    res.status(200).json({
+      success: true,
+      message: 'Notification preferences updated',
+      data: user.preferences.notifications
+    });
+  });
+
+  // Update privacy preferences
+  updatePrivacyPreferences = catchAsync(async (req, res) => {
+    const { privacy } = req.body;
+
+    await User.findByIdAndUpdate(
+      req.user.id,
+      {
+        'preferences.privacy': privacy,
+        updatedAt: new Date()
+      }
+    );
+
+    logger.info('Privacy preferences updated', { userId: req.user.id });
+
+    res.status(200).json({
+      success: true,
+      message: 'Privacy preferences updated'
+    });
+  });
+
+  // Update shopping preferences
+  updateShoppingPreferences = catchAsync(async (req, res) => {
+    const { shopping } = req.body;
+
+    await User.findByIdAndUpdate(
+      req.user.id,
+      {
+        'preferences.shopping': shopping,
+        updatedAt: new Date()
+      }
+    );
+
+    logger.info('Shopping preferences updated', { userId: req.user.id });
+
+    res.status(200).json({
+      success: true,
+      message: 'Shopping preferences updated'
+    });
+  });
+
+  // ===============================
+  // VENDOR MANAGEMENT
+  // ===============================
+
+  // Become a vendor
+  becomeVendor = catchAsync(async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({
+        error: 'Validation failed',
+        details: errors.array()
       });
     }
 
-  } catch (error) {
-    console.error('Resend verification error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Failed to resend verification email'
-    });
-  }
-};
+    const user = await User.findById(req.user.id);
 
-// @desc    Add address
-// @route   POST /api/users/addresses
-// @access  Private
-const addAddress = async (req, res) => {
-  try {
+    if (user.role === 'vendor') {
+      throw new AppError('User is already a vendor', 400, true, 'ALREADY_VENDOR');
+    }
+
     const {
-      type,
-      name,
-      street,
-      city,
-      state,
-      country,
-      zipCode,
-      phone,
-      isDefault = false
+      storeName,
+      storeDescription,
+      businessType,
+      businessRegistration,
+      taxId,
+      bankAccount
     } = req.body;
 
-    const userId = req.user._id;
+    // Update user role
+    user.role = 'vendor';
 
-    // Validate required fields
-    if (!type || !name || !street || !city || !state || !country || !zipCode) {
-      return res.status(400).json({
-        success: false,
-        error: 'Please provide all required fields'
-      });
-    }
-
-    // Sanitize inputs
-    const sanitizedName = sanitizeInput(name);
-    const sanitizedStreet = sanitizeInput(street);
-    const sanitizedCity = sanitizeInput(city);
-    const sanitizedState = sanitizeInput(state);
-    const sanitizedCountry = sanitizeInput(country);
-    const sanitizedZipCode = sanitizeInput(zipCode);
-
-    // Validate address type
-    const validTypes = ['home', 'work', 'other'];
-    if (!validTypes.includes(type)) {
-      return res.status(400).json({
-        success: false,
-        error: 'Invalid address type'
-      });
-    }
-
-    // If this is set as default, remove default from other addresses
-    if (isDefault) {
-      await User.updateOne(
-        { _id: userId },
-        { $unset: { 'addresses.$[].isDefault': 1 } }
-      );
-    }
-
-    // Add new address
-    const user = await User.findByIdAndUpdate(
-      userId,
-      {
-        $push: {
-          addresses: {
-            type,
-            name: sanitizedName,
-            street: sanitizedStreet,
-            city: sanitizedCity,
-            state: sanitizedState,
-            country: sanitizedCountry,
-            zipCode: sanitizedZipCode,
-            phone: phone ? sanitizeInput(phone) : undefined,
-            isDefault: isDefault || false
-          }
-        }
+    // Initialize vendor profile
+    user.vendorProfile = {
+      storeName,
+      storeDescription,
+      businessType,
+      businessRegistration,
+      taxId,
+      isVerified: false,
+      bankAccount,
+      payoutSettings: {
+        method: 'bank_transfer',
+        frequency: 'weekly',
+        minimumAmount: 10
       },
-      { new: true }
-    );
-
-    if (!user) {
-      return res.status(404).json({
-        success: false,
-        error: 'User not found'
-      });
-    }
-
-    const newAddress = user.addresses[user.addresses.length - 1];
-
-    res.status(201).json({
-      success: true,
-      message: 'Address added successfully',
-      data: {
-        address: newAddress
-      }
-    });
-
-  } catch (error) {
-    console.error('Add address error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Failed to add address'
-    });
-  }
-};
-
-// @desc    Update address
-// @route   PUT /api/users/addresses/:addressId
-// @access  Private
-const updateAddress = async (req, res) => {
-  try {
-    const { addressId } = req.params;
-    const updates = req.body;
-    const userId = req.user._id;
-
-    // Fields that can be updated in address
-    const allowedUpdates = [
-      'type', 'name', 'street', 'city', 'state', 'country', 'zipCode', 'phone', 'isDefault'
-    ];
-
-    // Filter updates
-    const filteredUpdates = {};
-    Object.keys(updates).forEach(key => {
-      if (allowedUpdates.includes(key)) {
-        filteredUpdates[`addresses.$.${key}`] = sanitizeInput(updates[key]);
-      }
-    });
-
-    // Validate address type if provided
-    if (filteredUpdates['addresses.$.type']) {
-      const validTypes = ['home', 'work', 'other'];
-      if (!validTypes.includes(filteredUpdates['addresses.$.type'])) {
-        return res.status(400).json({
-          success: false,
-          error: 'Invalid address type'
-        });
-      }
-    }
-
-    // If setting as default, remove default from other addresses
-    if (filteredUpdates['addresses.$.isDefault'] === true) {
-      await User.updateOne(
-        { _id: userId },
-        { $unset: { 'addresses.$[].isDefault': 1 } }
-      );
-    }
-
-    // Update address
-    const user = await User.findOneAndUpdate(
-      {
-        _id: userId,
-        'addresses._id': addressId
-      },
-      { $set: filteredUpdates },
-      { new: true }
-    );
-
-    if (!user) {
-      return res.status(404).json({
-        success: false,
-        error: 'Address not found'
-      });
-    }
-
-    const updatedAddress = user.addresses.id(addressId);
-
-    res.json({
-      success: true,
-      message: 'Address updated successfully',
-      data: {
-        address: updatedAddress
-      }
-    });
-
-  } catch (error) {
-    console.error('Update address error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Failed to update address'
-    });
-  }
-};
-
-// @desc    Delete address
-// @route   DELETE /api/users/addresses/:addressId
-// @access  Private
-const deleteAddress = async (req, res) => {
-  try {
-    const { addressId } = req.params;
-    const userId = req.user._id;
-
-    const user = await User.findByIdAndUpdate(
-      userId,
-      { $pull: { addresses: { _id: addressId } } },
-      { new: true }
-    );
-
-    if (!user) {
-      return res.status(404).json({
-        success: false,
-        error: 'User not found'
-      });
-    }
-
-    // If deleted address was default, set another as default
-    const deletedAddress = user.addresses.find(addr => addr._id.toString() === addressId);
-    if (deletedAddress && deletedAddress.isDefault && user.addresses.length > 0) {
-      user.addresses[0].isDefault = true;
-      await user.save();
-    }
-
-    res.json({
-      success: true,
-      message: 'Address deleted successfully'
-    });
-
-  } catch (error) {
-    console.error('Delete address error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Failed to delete address'
-    });
-  }
-};
-
-// @desc    Add to wishlist
-// @route   POST /api/users/wishlist
-// @access  Private
-const addToWishlist = async (req, res) => {
-  try {
-    const { productId } = req.body;
-    const userId = req.user._id;
-
-    if (!productId) {
-      return res.status(400).json({
-        success: false,
-        error: 'Product ID is required'
-      });
-    }
-
-    // Check if product exists
-    const Product = require('../models/Product');
-    const product = await Product.findById(productId);
-
-    if (!product) {
-      return res.status(404).json({
-        success: false,
-        error: 'Product not found'
-      });
-    }
-
-    const user = await User.findById(userId);
-
-    // Add to wishlist
-    await user.addToWishlist(productId);
-
-    res.json({
-      success: true,
-      message: 'Product added to wishlist'
-    });
-
-  } catch (error) {
-    console.error('Add to wishlist error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Failed to add to wishlist'
-    });
-  }
-};
-
-// @desc    Remove from wishlist
-// @route   DELETE /api/users/wishlist/:productId
-// @access  Private
-const removeFromWishlist = async (req, res) => {
-  try {
-    const { productId } = req.params;
-    const userId = req.user._id;
-
-    const user = await User.findById(userId);
-
-    // Remove from wishlist
-    await user.removeFromWishlist(productId);
-
-    res.json({
-      success: true,
-      message: 'Product removed from wishlist'
-    });
-
-  } catch (error) {
-    console.error('Remove from wishlist error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Failed to remove from wishlist'
-    });
-  }
-};
-
-// @desc    Get wishlist
-// @route   GET /api/users/wishlist
-// @access  Private
-const getWishlist = async (req, res) => {
-  try {
-    const userId = req.user._id;
-    const page = parseInt(req.query.page) || 1;
-    const limit = parseInt(req.query.limit) || 20;
-    const skip = (page - 1) * limit;
-
-    const user = await User.findById(userId)
-      .populate({
-        path: 'shopping.wishList.product',
-        select: 'name slug price images rating category',
-        populate: {
-          path: 'category',
-          select: 'name slug'
-        }
-      });
-
-    const wishlistItems = user.shopping.wishList
-      .slice(skip, skip + limit)
-      .map(item => ({
-        product: item.product,
-        addedAt: item.addedAt
-      }));
-
-    res.json({
-      success: true,
-      data: {
-        wishlist: wishlistItems,
-        pagination: {
-          page,
-          limit,
-          total: user.shopping.wishList.length,
-          pages: Math.ceil(user.shopping.wishList.length / limit)
-        }
-      }
-    });
-
-  } catch (error) {
-    console.error('Get wishlist error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Failed to fetch wishlist'
-    });
-  }
-};
-
-// @desc    Add recently viewed product
-// @route   POST /api/users/recently-viewed
-// @access  Private
-const addRecentlyViewed = async (req, res) => {
-  try {
-    const { productId } = req.body;
-    const userId = req.user._id;
-
-    if (!productId) {
-      return res.status(400).json({
-        success: false,
-        error: 'Product ID is required'
-      });
-    }
-
-    const user = await User.findById(userId);
-
-    // Add to recently viewed
-    await user.addRecentlyViewed(productId);
-
-    res.json({
-      success: true,
-      message: 'Product added to recently viewed'
-    });
-
-  } catch (error) {
-    console.error('Add recently viewed error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Failed to add to recently viewed'
-    });
-  }
-};
-
-// @desc    Get recently viewed products
-// @route   GET /api/users/recently-viewed
-// @access  Private
-const getRecentlyViewed = async (req, res) => {
-  try {
-    const userId = req.user._id;
-    const limit = parseInt(req.query.limit) || 20;
-
-    const user = await User.findById(userId)
-      .populate({
-        path: 'shopping.recentlyViewed.product',
-        select: 'name slug price images rating category',
-        populate: {
-          path: 'category',
-          select: 'name slug'
-        }
-      });
-
-    const recentlyViewedItems = user.shopping.recentlyViewed
-      .slice(0, limit)
-      .map(item => ({
-        product: item.product,
-        viewedAt: item.viewedAt
-      }));
-
-    res.json({
-      success: true,
-      data: {
-        recentlyViewed: recentlyViewedItems
-      }
-    });
-
-  } catch (error) {
-    console.error('Get recently viewed error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Failed to fetch recently viewed products'
-    });
-  }
-};
-
-// @desc    Logout user
-// @route   POST /api/users/logout
-// @access  Private
-const logoutUser = async (req, res) => {
-  try {
-    const userId = req.user._id;
-    const deviceId = req.headers['user-agent'] ? 
-      require('crypto').createHash('md5').update(req.headers['user-agent']).digest('hex') : 
-      'unknown';
-
-    // Remove device from user's device info
-    await User.updateOne(
-      { _id: userId },
-      { $pull: { deviceInfo: { deviceId } } }
-    );
-
-    // Clear refresh token cookie
-    res.clearCookie('refreshToken');
-
-    res.json({
-      success: true,
-      message: 'Logged out successfully'
-    });
-
-  } catch (error) {
-    console.error('Logout error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Logout failed'
-    });
-  }
-};
-
-// @desc    Refresh token
-// @route   POST /api/users/refresh-token
-// @access  Public
-const refreshToken = async (req, res) => {
-  try {
-    const { refreshToken } = req.body;
-
-    if (!refreshToken) {
-      return res.status(400).json({
-        success: false,
-        error: 'Refresh token is required'
-      });
-    }
-
-    // Verify refresh token
-    const decoded = verifyRefreshToken(refreshToken);
-
-    // Find user
-    const user = await User.findById(decoded.id);
-
-    if (!user) {
-      return res.status(401).json({
-        success: false,
-        error: 'Invalid refresh token'
-      });
-    }
-
-    if (user.status !== 'active') {
-      return res.status(401).json({
-        success: false,
-        error: 'Account is not active'
-      });
-    }
-
-    // Generate new tokens
-    const newToken = generateToken(user._id, user.email, user.role);
-    const newRefreshToken = generateRefreshToken(user._id);
-
-    res.json({
-      success: true,
-      data: {
-        token: newToken,
-        refreshToken: newRefreshToken,
-        user: {
-          id: user._id,
-          firstName: user.firstName,
-          lastName: user.lastName,
-          email: user.email,
-          role: user.role
-        }
-      }
-    });
-
-  } catch (error) {
-    console.error('Refresh token error:', error);
-    res.status(401).json({
-      success: false,
-      error: 'Invalid refresh token'
-    });
-  }
-};
-
-// @desc    Get user statistics
-// @route   GET /api/users/statistics
-// @access  Private
-const getUserStatistics = async (req, res) => {
-  try {
-    const userId = req.user._id;
-
-    const user = await User.findById(userId);
-
-    // Get order statistics
-    const Order = require('../models/Order');
-    const orderStats = await Order.aggregate([
-      { $match: { user: user._id } },
-      {
-        $group: {
-          _id: null,
-          totalOrders: { $sum: 1 },
-          totalSpent: { $sum: '$totalAmount' },
-          averageOrderValue: { $avg: '$totalAmount' },
-          lastOrderDate: { $max: '$orderDate' }
-        }
-      }
-    ]);
-
-    // Get review statistics
-    const Review = require('../models/Review');
-    const reviewStats = await Review.aggregate([
-      { $match: { user: user._id } },
-      {
-        $group: {
-          _id: null,
-          totalReviews: { $sum: 1 },
-          averageRating: { $avg: '$rating' },
-          helpfulVotes: { $sum: '$helpful' }
-        }
-      }
-    ]);
-
-    // Get cart statistics
-    const cart = await Cart.findByUser(userId);
-    const cartStats = cart ? cart.getCartValue() : { itemCount: 0, total: 0 };
-
-    const stats = {
-      account: user.getStatistics(),
-      orders: orderStats[0] || { totalOrders: 0, totalSpent: 0, averageOrderValue: 0 },
-      reviews: reviewStats[0] || { totalReviews: 0, averageRating: 0, helpfulVotes: 0 },
-      cart: cartStats,
-      wishlist: {
-        count: user.shopping.wishList.length
-      },
-      activity: {
-        lastLogin: user.lastLogin,
-        loginCount: user.loginCount,
-        memberSince: user.createdAt
+      performance: {
+        rating: 0,
+        totalSales: 0,
+        totalOrders: 0,
+        joinedAt: new Date()
       }
     };
 
-    res.json({
+    await user.save();
+
+    // Create default store
+    const store = new Store({
+      name: storeName,
+      description: storeDescription,
+      owner: user._id,
+      businessInfo: {
+        businessType,
+        businessRegistration,
+        taxId
+      },
+      financial: {
+        bankAccount,
+        payoutSettings: {
+          method: 'bank_transfer',
+          frequency: 'weekly',
+          minimumAmount: 10
+        }
+      },
+      status: 'pending',
+      verificationStatus: 'unverified'
+    });
+
+    await store.save();
+
+    // Update user with store reference
+    user.vendorProfile.store = store._id;
+    await user.save();
+
+    // Send welcome vendor email
+    await emailTransporter.sendMail({
+      from: process.env.EMAIL_FROM,
+      to: user.email,
+      subject: 'Welcome to Vendor Program!',
+      html: `
+        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+          <h2>Welcome to Our Vendor Program!</h2>
+          <p>Hello ${user.firstName},</p>
+          <p>Congratulations! You have successfully joined our vendor program.</p>
+          <p>Your store "${storeName}" is currently under review. We'll notify you once it's approved.</p>
+          <p>In the meantime, you can start adding products and setting up your store.</p>
+          <p>Best regards,<br>The Team</p>
+        </div>
+      `
+    });
+
+    logger.info('User became vendor', { userId: user._id, storeId: store._id });
+
+    res.status(200).json({
       success: true,
-      data: { statistics: stats }
+      message: 'Successfully joined vendor program',
+      data: {
+        user: user.getPublicProfile(),
+        store: store
+      }
+    });
+  });
+
+  // Get vendor dashboard
+  getVendorDashboard = catchAsync(async (req, res) => {
+    const user = await User.findById(req.user.id);
+    const store = await Store.findById(user.vendorProfile.store);
+
+    if (!store) {
+      throw new AppError('Store not found', 404, true, 'STORE_NOT_FOUND');
+    }
+
+    // Get recent orders
+    const recentOrders = await Order.findByVendor(user._id, { limit: 10 });
+
+    // Get pending orders
+    const pendingOrders = await Order.findByVendor(user._id, {
+      status: 'pending',
+      limit: 5
     });
 
-  } catch (error) {
-    console.error('Get user statistics error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Failed to fetch user statistics'
+    // Get store products
+    const products = await store.getProducts({ limit: 10 });
+
+    // Get analytics data
+    const analytics = await store.getDashboardData(30);
+
+    res.status(200).json({
+      success: true,
+      data: {
+        store: {
+          ...store.toObject(),
+          isActive: store.isActive
+        },
+        stats: {
+          totalProducts: store.analytics.totalProducts,
+          totalOrders: store.analytics.totalOrders,
+          totalSales: store.analytics.totalSales,
+          averageOrderValue: store.analytics.averageOrderValue,
+          rating: store.analytics.rating,
+          customerCount: store.analytics.customerCount
+        },
+        recentOrders,
+        pendingOrders,
+        products,
+        analytics,
+        notifications: await this.getVendorNotifications(user._id)
+      }
+    });
+  });
+
+  // Update vendor profile
+  updateVendorProfile = catchAsync(async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({
+        error: 'Validation failed',
+        details: errors.array()
+      });
+    }
+
+    const allowedFields = [
+      'storeName', 'storeDescription', 'businessType',
+      'businessRegistration', 'taxId'
+    ];
+
+    const updates = {};
+    allowedFields.forEach(field => {
+      if (req.body[field] !== undefined) {
+        updates[`vendorProfile.${field}`] = req.body[field];
+      }
+    });
+
+    // Handle bank account update
+    if (req.body.bankAccount) {
+      updates['vendorProfile.bankAccount'] = req.body.bankAccount;
+    }
+
+    const user = await User.findByIdAndUpdate(
+      req.user.id,
+      { ...updates, updatedAt: new Date() },
+      { new: true, runValidators: true }
+    );
+
+    // Update store information
+    if (user.vendorProfile.store) {
+      await Store.findByIdAndUpdate(user.vendorProfile.store, {
+        name: user.vendorProfile.storeName,
+        description: user.vendorProfile.storeDescription,
+        businessInfo: {
+          businessType: user.vendorProfile.businessType,
+          businessRegistration: user.vendorProfile.businessRegistration,
+          taxId: user.vendorProfile.taxId
+        },
+        financial: {
+          bankAccount: user.vendorProfile.bankAccount
+        }
+      });
+    }
+
+    logger.info('Vendor profile updated', { userId: user._id });
+
+    res.status(200).json({
+      success: true,
+      message: 'Vendor profile updated successfully',
+      data: user.vendorProfile
+    });
+  });
+
+  // ===============================
+  // ADMIN FUNCTIONS
+  // ===============================
+
+  // Get all users (admin only)
+  getAllUsers = catchAsync(async (req, res) => {
+    const {
+      role,
+      status,
+      verified,
+      search,
+      sortBy = 'createdAt',
+      sortOrder = 'desc',
+      page = 1,
+      limit = 20
+    } = req.query;
+
+    let query = {};
+
+    // Role filter
+    if (role) query.role = role;
+
+    // Status filter
+    if (status === 'active') query.isActive = true;
+    if (status === 'inactive') query.isActive = false;
+    if (status === 'verified') query.isVerified = true;
+    if (status === 'unverified') query.isVerified = false;
+
+    // Verification filter
+    if (verified === 'email') query.isEmailVerified = true;
+    if (verified === 'phone') query.isPhoneVerified = true;
+
+    // Search filter
+    if (search) {
+      query.$or = [
+        { firstName: { $regex: search, $options: 'i' } },
+        { lastName: { $regex: search, $options: 'i' } },
+        { email: { $regex: search, $options: 'i' } },
+        { phone: { $regex: search, $options: 'i' } }
+      ];
+    }
+
+    // Sorting
+    let sort = {};
+    sort[sortBy] = sortOrder === 'desc' ? -1 : 1;
+
+    const users = await User.find(query)
+      .select('-password -twoFactorSecret -twoFactorBackupCodes')
+      .sort(sort)
+      .limit(limit * 1)
+      .skip((page - 1) * limit)
+      .populate('referrals.user', 'firstName lastName');
+
+    const total = await User.countDocuments(query);
+
+    res.status(200).json({
+      success: true,
+      data: {
+        users,
+        pagination: {
+          currentPage: page,
+          totalPages: Math.ceil(total / limit),
+          totalUsers: total,
+          hasNext: page < Math.ceil(total / limit),
+          hasPrev: page > 1
+        }
+      }
+    });
+  });
+
+  // Get user by ID (admin only)
+  getUserById = catchAsync(async (req, res) => {
+    const { id } = req.params;
+
+    const user = await User.findById(id)
+      .select('-password -twoFactorSecret -twoFactorBackupCodes')
+      .populate('referrals.user', 'firstName lastName')
+      .populate('referredBy', 'firstName lastName');
+
+    if (!user) {
+      throw new AppError('User not found', 404, true, 'USER_NOT_FOUND');
+    }
+
+    // Get user's recent activity
+    const recentActivity = await this.getUserActivity(id);
+
+    res.status(200).json({
+      success: true,
+      data: {
+        user,
+        recentActivity,
+        stats: {
+          totalOrders: user.totalOrders,
+          totalSpent: user.totalSpent,
+          loyaltyPoints: user.customerProfile?.loyaltyPoints || 0,
+          accountAge: user.accountAge,
+          lastLogin: user.lastLogin,
+          loginHistory: user.loginHistory.slice(0, 10)
+        }
+      }
+    });
+  });
+
+  // Update user (admin only)
+  updateUser = catchAsync(async (req, res) => {
+    const { id } = req.params;
+    const updates = req.body;
+
+    // Prevent updating sensitive fields
+    const forbiddenFields = ['password', 'twoFactorSecret', 'twoFactorBackupCodes', '_id'];
+    forbiddenFields.forEach(field => {
+      delete updates[field];
+    });
+
+    const user = await User.findByIdAndUpdate(
+      id,
+      { ...updates, updatedAt: new Date(), updatedBy: req.user.id },
+      { new: true, runValidators: true }
+    );
+
+    if (!user) {
+      throw new AppError('User not found', 404, true, 'USER_NOT_FOUND');
+    }
+
+    logger.info('User updated by admin', {
+      updatedBy: req.user.id,
+      userId: id,
+      updates: Object.keys(updates)
+    });
+
+    res.status(200).json({
+      success: true,
+      message: 'User updated successfully',
+      data: user
+    });
+  });
+
+  // Delete user (admin only)
+  deleteUser = catchAsync(async (req, res) => {
+    const { id } = req.params;
+    const { reason } = req.body;
+
+    const user = await User.findById(id);
+
+    if (!user) {
+      throw new AppError('User not found', 404, true, 'USER_NOT_FOUND');
+    }
+
+    // Soft delete
+    user.isDeleted = true;
+    user.deletedAt = new Date();
+    user.deletedBy = req.user.id;
+    await user.save();
+
+    // Cancel subscriptions
+    await this.cancelUserSubscriptions(id);
+
+    // Anonymize data
+    await this.anonymizeUserData(id);
+
+    logger.info('User deleted by admin', {
+      deletedBy: req.user.id,
+      userId: id,
+      reason
+    });
+
+    res.status(200).json({
+      success: true,
+      message: 'User deleted successfully'
+    });
+  });
+
+  // Suspend user (admin only)
+  suspendUser = catchAsync(async (req, res) => {
+    const { id } = req.params;
+    const { reason, duration = 24 } = req.body; // duration in hours
+
+    const user = await User.findById(id);
+
+    if (!user) {
+      throw new AppError('User not found', 404, true, 'USER_NOT_FOUND');
+    }
+
+    // Suspend user
+    user.isActive = false;
+    user.suspendedAt = new Date();
+    user.suspendedBy = req.user.id;
+    user.suspensionReason = reason;
+    user.suspensionExpires = new Date(Date.now() + duration * 60 * 60 * 1000);
+    await user.save();
+
+    // Send notification
+    await Notification.createNotification(id, {
+      type: 'account',
+      category: 'security',
+      title: 'Account Suspended',
+      message: `Your account has been suspended. Reason: ${reason}`,
+      priority: 'high',
+      actions: [{
+        type: 'link',
+        label: 'Contact Support',
+        url: '/support',
+        action: 'contact_support'
+      }]
+    });
+
+    logger.info('User suspended by admin', {
+      suspendedBy: req.user.id,
+      userId: id,
+      reason,
+      duration
+    });
+
+    res.status(200).json({
+      success: true,
+      message: 'User suspended successfully'
+    });
+  });
+
+  // Activate user (admin only)
+  activateUser = catchAsync(async (req, res) => {
+    const { id } = req.params;
+
+    const user = await User.findById(id);
+
+    if (!user) {
+      throw new AppError('User not found', 404, true, 'USER_NOT_FOUND');
+    }
+
+    user.isActive = true;
+    user.suspendedAt = undefined;
+    user.suspendedBy = undefined;
+    user.suspensionReason = undefined;
+    user.suspensionExpires = undefined;
+    await user.save();
+
+    // Send notification
+    await Notification.createNotification(id, {
+      type: 'account',
+      category: 'informational',
+      title: 'Account Activated',
+      message: 'Your account has been activated and is now fully functional.',
+      priority: 'normal'
+    });
+
+    logger.info('User activated by admin', {
+      activatedBy: req.user.id,
+      userId: id
+    });
+
+    res.status(200).json({
+      success: true,
+      message: 'User activated successfully'
+    });
+  });
+
+  // Get user statistics (admin only)
+  getUserStats = catchAsync(async (req, res) => {
+    const stats = await User.getUserStats();
+
+    // Get additional analytics
+    const totalUsers = await User.countDocuments({ isDeleted: false });
+    const activeUsers = await User.countDocuments({ isActive: true, isDeleted: false });
+    const verifiedUsers = await User.countDocuments({ isVerified: true, isDeleted: false });
+    const vendors = await User.countDocuments({ role: 'vendor', isDeleted: false });
+
+    res.status(200).json({
+      success: true,
+      data: {
+        overview: {
+          totalUsers,
+          activeUsers,
+          verifiedUsers,
+          vendors,
+          customers: totalUsers - vendors
+        },
+        roleDistribution: stats,
+        recentActivity: await this.getRecentUserActivity()
+      }
+    });
+  });
+
+  // ===============================
+  // HELPER METHODS
+  // ===============================
+
+  // Process referral reward
+  async processReferralReward(referrerId, referredUserId) {
+    const referrer = await User.findById(referrerId);
+    const referredUser = await User.findById(referredUserId);
+
+    // Add loyalty points to referrer
+    await referrer.addLoyaltyPoints(100, `Referral: ${referredUser.firstName} joined`);
+
+    // Add to referrer's referrals
+    referrer.referrals.push({
+      user: referredUserId,
+      joinedAt: new Date(),
+      rewardEarned: 100
+    });
+
+    await referrer.save();
+
+    // Send notification to referrer
+    await Notification.createNotification(referrerId, {
+      type: 'account',
+      category: 'informational',
+      title: 'Referral Reward Earned!',
+      message: `${referredUser.firstName} joined using your referral code. You've earned 100 loyalty points!`,
+      priority: 'normal'
     });
   }
-};
 
-// Helper functions
-const getDeviceType = (userAgent) => {
-  if (!userAgent) return 'unknown';
-  
-  if (/mobile|android|iphone|ipad|phone/i.test(userAgent)) {
-    return 'mobile';
+  // Cancel user subscriptions
+  async cancelUserSubscriptions(userId) {
+    // Implementation for canceling subscriptions
+    // This would integrate with payment processors
+    logger.info('User subscriptions cancelled', { userId });
   }
-  if (/tablet/i.test(userAgent)) {
-    return 'tablet';
+
+  // Anonymize user data
+  async anonymizeUserData(userId) {
+    // Anonymize sensitive user data
+    await User.findByIdAndUpdate(userId, {
+      firstName: 'Deleted',
+      lastName: 'User',
+      email: `deleted.${userId}@anonymous.local`,
+      phone: null,
+      avatar: null,
+      bio: null,
+      socialLinks: {},
+      address: null,
+      preferences: {},
+      isEmailVerified: false,
+      isPhoneVerified: false
+    });
+
+    logger.info('User data anonymized', { userId });
   }
-  return 'desktop';
-};
 
-const getBrowser = (userAgent) => {
-  if (!userAgent) return 'unknown';
-  
-  if (userAgent.includes('Chrome')) return 'Chrome';
-  if (userAgent.includes('Firefox')) return 'Firefox';
-  if (userAgent.includes('Safari')) return 'Safari';
-  if (userAgent.includes('Edge')) return 'Edge';
-  if (userAgent.includes('Opera')) return 'Opera';
-  
-  return 'unknown';
-};
+  // Get user activity
+  async getUserActivity(userId) {
+    const activities = [];
 
-const getLocationFromIP = async (ip) => {
-  try {
-    // This would typically use a geolocation service
-    return 'Unknown';
-  } catch (error) {
-    return 'Unknown';
+    // Get recent orders
+    const recentOrders = await Order.findByUser(userId, { limit: 5 });
+    activities.push(...recentOrders.map(order => ({
+      type: 'order',
+      description: `Ordered ${order.items.length} items`,
+      amount: order.pricing.totalAmount,
+      date: order.createdAt,
+      data: { orderNumber: order.orderNumber }
+    })));
+
+    // Get recent reviews
+    const recentReviews = await Review.findByUser(userId, { limit: 5 });
+    activities.push(...recentReviews.map(review => ({
+      type: 'review',
+      description: `Reviewed "${review.product.name}"`,
+      rating: review.rating,
+      date: review.createdAt,
+      data: { productId: review.product }
+    })));
+
+    return activities.sort((a, b) => b.date - a.date).slice(0, 10);
   }
-};
 
-module.exports = {
-  registerUser,
-  loginUser,
-  getUserProfile,
-  updateUserProfile,
-  changePassword,
-  forgotPassword,
-  resetPassword,
-  verifyEmail,
-  resendVerification,
-  addAddress,
-  updateAddress,
-  deleteAddress,
-  addToWishlist,
-  removeFromWishlist,
-  getWishlist,
-  addRecentlyViewed,
-  getRecentlyViewed,
-  logoutUser,
-  refreshToken,
-  getUserStatistics
-};
+  // Get recent user activity (admin)
+  async getRecentUserActivity() {
+    // Get recent registrations
+    const recentUsers = await User.find({ isDeleted: false })
+      .sort({ createdAt: -1 })
+      .limit(10)
+      .select('firstName lastName email role createdAt');
+
+    // Get recent logins
+    const recentLogins = await User.find({ isDeleted: false })
+      .sort({ lastLogin: -1 })
+      .limit(10)
+      .select('firstName lastName email lastLogin');
+
+    return {
+      recentRegistrations: recentUsers,
+      recentLogins: recentLogins
+    };
+  }
+
+  // Get vendor notifications
+  async getVendorNotifications(userId) {
+    const notifications = await Notification.findByUser(userId, {
+      type: { $in: ['order', 'product', 'vendor', 'payment'] },
+      limit: 10
+    });
+
+    return notifications;
+  }
+}
+
+module.exports = new UserController();

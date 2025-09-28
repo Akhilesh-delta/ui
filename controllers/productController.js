@@ -1,212 +1,220 @@
 const Product = require('../models/Product');
 const Category = require('../models/Category');
 const User = require('../models/User');
+const Store = require('../models/Store');
 const Review = require('../models/Review');
-const { 
-  authenticate, 
-  requireVendorOrAdmin,
-  sanitizeInput
-} = require('../middleware/authMiddleware');
+const Order = require('../models/Order');
+const Cart = require('../models/Cart');
+const Notification = require('../models/Notification');
+const cloudinary = require('cloudinary').v2;
+const { validationResult } = require('express-validator');
+const { AppError, catchAsync } = require('../middleware/errorHandler');
+const logger = require('../utils/logger');
+const mongoose = require('mongoose');
 
-// @desc    Create new product
-// @route   POST /api/products
-// @access  Private (Vendor/Admin)
-const createProduct = async (req, res) => {
-  try {
-    const userId = req.user._id;
-    const productData = req.body;
+// Cloudinary configuration
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET
+});
 
-    // Check if user is vendor or admin
-    const user = await User.findById(userId);
-    if (!user || (user.role !== 'vendor' && user.role !== 'admin')) {
-      return res.status(403).json({
-        success: false,
-        error: 'Access denied. Vendor access required.'
-      });
-    }
+class ProductController {
+  // ===============================
+  // BASIC CRUD OPERATIONS
+  // ===============================
 
-    // Validate required fields
-    if (!productData.name || !productData.description || !productData.price || !productData.category) {
+  // Create new product
+  createProduct = catchAsync(async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
       return res.status(400).json({
-        success: false,
-        error: 'Please provide all required fields: name, description, price, category'
+        error: 'Validation failed',
+        details: errors.array()
       });
     }
+
+    const user = await User.findById(req.user.id);
+    const store = await Store.findById(user.vendorProfile.store);
+
+    if (!store || !store.isActive) {
+      throw new AppError('Store not found or inactive', 404, true, 'STORE_NOT_FOUND');
+    }
+
+    const {
+      name,
+      description,
+      shortDescription,
+      category,
+      subcategories = [],
+      tags = [],
+      price,
+      compareAtPrice,
+      costPrice,
+      currency = 'USD',
+      variants = [],
+      attributes = [],
+      inventory = {},
+      shipping = {},
+      seo = {},
+      options = {},
+      customFields = []
+    } = req.body;
 
     // Validate category exists
-    const category = await Category.findById(productData.category);
-    if (!category) {
-      return res.status(404).json({
-        success: false,
-        error: 'Category not found'
-      });
+    const categoryDoc = await Category.findById(category);
+    if (!categoryDoc) {
+      throw new AppError('Category not found', 404, true, 'CATEGORY_NOT_FOUND');
     }
 
-    // Sanitize inputs
-    const sanitizedData = {
-      name: sanitizeInput(productData.name),
-      description: sanitizeInput(productData.description),
-      shortDescription: productData.shortDescription ? sanitizeInput(productData.shortDescription) : undefined,
-      sku: sanitizeInput(productData.sku),
-      vendor: userId,
-      category: productData.category,
-      subCategory: productData.subCategory || undefined,
-      brand: productData.brand ? sanitizeInput(productData.brand) : undefined,
-      price: parseFloat(productData.price),
-      compareAtPrice: productData.compareAtPrice ? parseFloat(productData.compareAtPrice) : undefined,
-      costPrice: productData.costPrice ? parseFloat(productData.costPrice) : undefined,
-      tags: productData.tags ? productData.tags.map(tag => sanitizeInput(tag).toLowerCase()) : [],
-      features: productData.features ? productData.features.map(feature => sanitizeInput(feature)) : [],
-      benefits: productData.benefits ? productData.benefits.map(benefit => sanitizeInput(benefit)) : []
-    };
+    // Handle product images
+    let productImages = [];
+    if (req.files && req.files.images) {
+      const imageFiles = Array.isArray(req.files.images) ? req.files.images : [req.files.images];
 
-    // Validate price
-    if (sanitizedData.price < 0) {
-      return res.status(400).json({
-        success: false,
-        error: 'Price cannot be negative'
-      });
-    }
+      for (const file of imageFiles) {
+        const result = await cloudinary.uploader.upload(file.path, {
+          folder: `products/${store._id}`,
+          quality: 'auto',
+          format: 'webp'
+        });
 
-    // Validate inventory
-    if (productData.inventory) {
-      sanitizedData.inventory = {
-        quantity: parseInt(productData.inventory.quantity) || 0,
-        trackQuantity: productData.inventory.trackQuantity !== false,
-        lowStockThreshold: parseInt(productData.inventory.lowStockThreshold) || 5,
-        allowBackorder: productData.inventory.allowBackorder || false,
-        maxOrderQuantity: parseInt(productData.inventory.maxOrderQuantity) || 10
-      };
-    }
-
-    // Validate dimensions
-    if (productData.dimensions) {
-      sanitizedData.dimensions = {
-        length: productData.dimensions.length ? parseFloat(productData.dimensions.length) : undefined,
-        width: productData.dimensions.width ? parseFloat(productData.dimensions.width) : undefined,
-        height: productData.dimensions.height ? parseFloat(productData.dimensions.height) : undefined,
-        unit: productData.dimensions.unit || 'cm'
-      };
-    }
-
-    // Validate weight
-    if (productData.weight) {
-      sanitizedData.weight = {
-        value: parseFloat(productData.weight.value),
-        unit: productData.weight.unit || 'kg'
-      };
-    }
-
-    // Validate shipping
-    if (productData.shipping) {
-      sanitizedData.shipping = {
-        requiresShipping: productData.shipping.requiresShipping !== false,
-        shippingClass: productData.shipping.shippingClass || 'standard',
-        handlingTime: parseInt(productData.shipping.handlingTime) || 1,
-        freeShipping: productData.shipping.freeShipping || false,
-        freeShippingMinimum: productData.shipping.freeShippingMinimum ? parseFloat(productData.shipping.freeShippingMinimum) : undefined
-      };
-    }
-
-    // Validate specifications
-    if (productData.specifications && Array.isArray(productData.specifications)) {
-      sanitizedData.specifications = productData.specifications.map(spec => ({
-        name: sanitizeInput(spec.name),
-        value: sanitizeInput(spec.value),
-        unit: spec.unit ? sanitizeInput(spec.unit) : undefined,
-        group: spec.group ? sanitizeInput(spec.group) : undefined
-      }));
-    }
-
-    // Validate attributes
-    if (productData.attributes && Array.isArray(productData.attributes)) {
-      sanitizedData.attributes = productData.attributes.map(attr => ({
-        name: sanitizeInput(attr.name),
-        value: sanitizeInput(attr.value),
-        visible: attr.visible !== false,
-        searchable: attr.searchable || false
-      }));
+        productImages.push({
+          url: result.secure_url,
+          public_id: result.public_id,
+          thumbnail: result.secure_url.replace('/upload/', '/upload/w_300,h_300,c_fill/'),
+          alt: `${name} - ${store.name}`,
+          uploadedAt: new Date()
+        });
+      }
     }
 
     // Create product
-    const product = await Product.create(sanitizedData);
+    const product = new Product({
+      name,
+      description,
+      shortDescription,
+      vendor: user._id,
+      store: store._id,
+      category,
+      subcategories,
+      tags,
+      price,
+      compareAtPrice,
+      costPrice,
+      currency,
+      variants,
+      attributes,
+      inventory: {
+        quantity: inventory.quantity || 0,
+        lowStockThreshold: inventory.lowStockThreshold || 5,
+        trackQuantity: inventory.trackQuantity !== false,
+        allowBackorders: inventory.allowBackorders || false,
+        stockStatus: inventory.quantity > 0 ? 'in_stock' : 'out_of_stock',
+        ...inventory
+      },
+      shipping,
+      seo,
+      options,
+      customFields,
+      images: productImages,
+      status: store.settings.autoPublishProducts ? 'published' : 'draft',
+      createdBy: user._id
+    });
 
-    // Populate category information
-    await product.populate('category', 'name slug');
-    if (product.subCategory) {
-      await product.populate('subCategory', 'name slug');
-    }
+    await product.save();
+
+    // Update category product count
+    await categoryDoc.updateStats();
+
+    // Update store product count
+    await store.updateAnalytics();
+
+    // Send notification to store owner
+    await Notification.createNotification(user._id, {
+      type: 'product',
+      category: 'informational',
+      title: 'Product Created',
+      message: `Your product "${name}" has been created successfully.`,
+      data: {
+        productId: product._id,
+        productName: name
+      },
+      priority: 'normal',
+      actions: [
+        {
+          type: 'link',
+          label: 'View Product',
+          url: `/products/${product.slug}`,
+          action: 'view_product'
+        },
+        {
+          type: 'link',
+          label: 'Edit Product',
+          url: `/vendor/products/${product._id}/edit`,
+          action: 'edit_product'
+        }
+      ]
+    });
+
+    logger.info('Product created', {
+      productId: product._id,
+      userId: user._id,
+      storeId: store._id
+    });
 
     res.status(201).json({
       success: true,
       message: 'Product created successfully',
-      data: {
-        product: {
-          id: product._id,
-          name: product.name,
-          slug: product.slug,
-          sku: product.sku,
-          price: product.price,
-          category: product.category,
-          subCategory: product.subCategory,
-          status: product.status,
-          createdAt: product.createdAt
-        }
-      }
+      data: product
     });
+  });
 
-  } catch (error) {
-    console.error('Create product error:', error);
-    if (error.code === 11000) {
-      return res.status(400).json({
-        success: false,
-        error: 'Product with this SKU already exists'
-      });
-    }
-    res.status(500).json({
-      success: false,
-      error: 'Failed to create product'
-    });
-  }
-};
-
-// @desc    Get all products
-// @route   GET /api/products
-// @access  Public
-const getProducts = async (req, res) => {
-  try {
+  // Get all products with advanced filtering
+  getProducts = catchAsync(async (req, res) => {
     const {
-      page = 1,
-      limit = 20,
+      // Basic filters
       category,
-      subcategory,
       vendor,
-      brand,
+      store,
+      search,
       minPrice,
       maxPrice,
       rating,
       inStock,
       featured,
-      trending,
-      search,
+      status = 'published',
+
+      // Advanced filters
+      brand,
+      tags,
+      attributes,
+      variants,
+      shipping,
+      location,
+
+      // Sorting and pagination
       sortBy = 'createdAt',
       sortOrder = 'desc',
-      tags
+      page = 1,
+      limit = 20,
+
+      // Display options
+      includeInactive = false,
+      includeVariants = false,
+      includeAnalytics = false
     } = req.query;
 
-    // Build query
-    let query = {
-      status: 'active',
-      visibility: 'public'
-    };
+    let query = { isDeleted: false };
 
-    // Category filters
-    if (category) {
-      query.category = category;
+    // Status filter
+    if (status) {
+      query.status = status;
     }
 
-    if (subcategory) {
-      query.subCategory = subcategory;
+    // Category filter
+    if (category) {
+      query.category = category;
     }
 
     // Vendor filter
@@ -214,35 +222,36 @@ const getProducts = async (req, res) => {
       query.vendor = vendor;
     }
 
-    // Brand filter
-    if (brand) {
-      query.brand = { $regex: brand, $options: 'i' };
+    // Store filter
+    if (store) {
+      query.store = store;
     }
 
-    // Price filters
-    if (minPrice !== undefined || maxPrice !== undefined) {
+    // Price range filter
+    if (minPrice || maxPrice) {
       query.price = {};
-      if (minPrice !== undefined) query.price.$gte = parseFloat(minPrice);
-      if (maxPrice !== undefined) query.price.$lte = parseFloat(maxPrice);
+      if (minPrice) query.price.$gte = parseFloat(minPrice);
+      if (maxPrice) query.price.$lte = parseFloat(maxPrice);
     }
 
     // Rating filter
     if (rating) {
-      query['rating.average'] = { $gte: parseInt(rating) };
+      query['rating.average'] = { $gte: parseFloat(rating) };
     }
 
     // Stock filter
     if (inStock === 'true') {
-      query['inventory.stockStatus'] = { $in: ['in_stock', 'low_stock'] };
+      query['inventory.stockStatus'] = 'in_stock';
     }
 
-    // Featured/Trending filters
-    if (featured === 'true') {
-      query.featured = true;
+    // Featured filter
+    if (featured !== undefined) {
+      query.featured = featured === 'true';
     }
 
-    if (trending === 'true') {
-      query.trending = true;
+    // Brand filter
+    if (brand) {
+      query.brand = { $regex: brand, $options: 'i' };
     }
 
     // Tags filter
@@ -251,1941 +260,2205 @@ const getProducts = async (req, res) => {
       query.tags = { $in: tagArray };
     }
 
-    // Search functionality
-    let products;
-    let total;
-
+    // Text search
     if (search) {
-      const searchResults = await Product.search(search, {
-        category: query.category,
-        vendor: query.vendor,
-        minPrice: query.price?.$gte,
-        maxPrice: query.price?.$lte,
-        inStock: inStock === 'true'
-      });
-
-      products = searchResults;
-      total = products.length;
-    } else {
-      // Build sort object
-      const sort = {};
-      sort[sortBy] = sortOrder === 'desc' ? -1 : 1;
-
-      products = await Product.find(query)
-        .populate('category', 'name slug')
-        .populate('vendor', 'firstName lastName businessName')
-        .sort(sort)
-        .limit(limit * 1)
-        .skip((page - 1) * limit)
-        .select('name slug sku price images rating category vendor featured trending createdAt');
-
-      total = await Product.countDocuments(query);
+      query.$text = { $search: search };
     }
 
-    // Get filter options for the response
-    const filterOptions = await getFilterOptions();
-
-    res.json({
-      success: true,
-      data: {
-        products,
-        pagination: {
-          page: parseInt(page),
-          limit: parseInt(limit),
-          total,
-          pages: Math.ceil(total / limit)
-        },
-        filters: filterOptions
-      }
-    });
-
-  } catch (error) {
-    console.error('Get products error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Failed to fetch products'
-    });
-  }
-};
-
-// @desc    Get single product
-// @route   GET /api/products/:id
-// @access  Public
-const getProduct = async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { includeReviews = false } = req.query;
-
-    const product = await Product.findOne({
-      $or: [{ _id: id }, { slug: id }],
-      status: 'active',
-      visibility: 'public'
-    })
-    .populate('category', 'name slug')
-    .populate('subCategory', 'name slug')
-    .populate('vendor', 'firstName lastName businessName rating reviewCount');
-
-    if (!product) {
-      return res.status(404).json({
-        success: false,
-        error: 'Product not found'
-      });
-    }
-
-    // Add view to product statistics
-    await product.addView();
-
-    // Get related products
-    const relatedProducts = await Product.find({
-      category: product.category._id,
-      _id: { $ne: product._id },
-      status: 'active',
-      visibility: 'public'
-    })
-    .limit(8)
-    .select('name slug price images rating')
-    .sort({ 'statistics.views': -1 });
-
-    // Get recently viewed products for this user (if authenticated)
-    let recentlyViewed = [];
-    if (req.user) {
-      const user = await User.findById(req.user._id);
-      recentlyViewed = await Product.find({
-        _id: { $in: user.shopping.recentlyViewed.slice(0, 5).map(item => item.product) }
-      })
-      .select('name slug price images rating');
-    }
-
-    // Get product reviews if requested
-    let reviews = [];
-    if (includeReviews === 'true') {
-      reviews = await Review.find({ product: product._id })
-        .populate('user', 'firstName lastName profile.avatar')
-        .sort({ createdAt: -1 })
-        .limit(10);
-    }
-
-    res.json({
-      success: true,
-      data: {
-        product: {
-          id: product._id,
-          name: product.name,
-          slug: product.slug,
-          description: product.description,
-          shortDescription: product.shortDescription,
-          sku: product.sku,
-          price: product.price,
-          discountedPrice: product.discountedPrice,
-          compareAtPrice: product.compareAtPrice,
-          discount: product.discount,
-          savingsAmount: product.savingsAmount,
-          savingsPercentage: product.savingsPercentage,
-          category: product.category,
-          subCategory: product.subCategory,
-          brand: product.brand,
-          vendor: product.vendor,
-          images: product.images,
-          videos: product.videos,
-          specifications: product.getFormattedSpecifications(),
-          features: product.features,
-          benefits: product.benefits,
-          attributes: product.attributes,
-          tags: product.tags,
-          dimensions: product.dimensions,
-          weight: product.weight,
-          shipping: product.shipping,
-          inventory: {
-            quantity: product.inventory.quantity,
-            stockStatus: product.inventory.stockStatus,
-            allowBackorder: product.inventory.allowBackorder,
-            maxOrderQuantity: product.inventory.maxOrderQuantity
-          },
-          rating: product.rating,
-          status: product.status,
-          featured: product.featured,
-          trending: product.trending,
-          options: product.options,
-          seo: product.seo,
-          createdAt: product.createdAt,
-          updatedAt: product.updatedAt
-        },
-        relatedProducts,
-        recentlyViewed,
-        reviews: includeReviews === 'true' ? reviews : undefined,
-        statistics: product.getAnalytics()
-      }
-    });
-
-  } catch (error) {
-    console.error('Get product error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Failed to fetch product'
-    });
-  }
-};
-
-// @desc    Update product
-// @route   PUT /api/products/:id
-// @access  Private (Vendor/Admin)
-const updateProduct = async (req, res) => {
-  try {
-    const { id } = req.params;
-    const updates = req.body;
-    const userId = req.user._id;
-
-    const product = await Product.findById(id);
-    if (!product) {
-      return res.status(404).json({
-        success: false,
-        error: 'Product not found'
-      });
-    }
-
-    // Check ownership
-    if (product.vendor.toString() !== userId.toString() && req.user.role !== 'admin') {
-      return res.status(403).json({
-        success: false,
-        error: 'Access denied. You can only update your own products.'
-      });
-    }
-
-    // Fields that can be updated
-    const allowedUpdates = [
-      'name', 'description', 'shortDescription', 'brand', 'price', 'compareAtPrice',
-      'costPrice', 'category', 'subCategory', 'tags', 'features', 'benefits',
-      'specifications', 'attributes', 'dimensions', 'weight', 'shipping',
-      'inventory', 'options', 'seo', 'status', 'visibility', 'featured', 'trending'
-    ];
-
-    // Filter updates to only allowed fields
-    const filteredUpdates = {};
-    Object.keys(updates).forEach(key => {
-      if (allowedUpdates.includes(key)) {
-        if (key === 'name' || key === 'description' || key === 'shortDescription' || key === 'brand') {
-          filteredUpdates[key] = sanitizeInput(updates[key]);
-        } else if (key === 'price' || key === 'compareAtPrice' || key === 'costPrice') {
-          filteredUpdates[key] = parseFloat(updates[key]);
-        } else if (key === 'tags' && Array.isArray(updates[key])) {
-          filteredUpdates[key] = updates[key].map(tag => sanitizeInput(tag).toLowerCase());
-        } else if (key === 'features' && Array.isArray(updates[key])) {
-          filteredUpdates[key] = updates[key].map(feature => sanitizeInput(feature));
-        } else if (key === 'benefits' && Array.isArray(updates[key])) {
-          filteredUpdates[key] = updates[key].map(benefit => sanitizeInput(benefit));
-        } else {
-          filteredUpdates[key] = updates[key];
-        }
-      }
-    });
-
-    // Validate category if being updated
-    if (filteredUpdates.category) {
-      const category = await Category.findById(filteredUpdates.category);
-      if (!category) {
-        return res.status(404).json({
-          success: false,
-          error: 'Category not found'
-        });
-      }
-    }
-
-    // Validate price
-    if (filteredUpdates.price !== undefined && filteredUpdates.price < 0) {
-      return res.status(400).json({
-        success: false,
-        error: 'Price cannot be negative'
-      });
-    }
-
-    // Update product
-    const updatedProduct = await Product.findByIdAndUpdate(
-      id,
-      { $set: filteredUpdates },
-      { new: true, runValidators: true }
-    )
-    .populate('category', 'name slug')
-    .populate('subCategory', 'name slug');
-
-    res.json({
-      success: true,
-      message: 'Product updated successfully',
-      data: {
-        product: updatedProduct
-      }
-    });
-
-  } catch (error) {
-    console.error('Update product error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Failed to update product'
-    });
-  }
-};
-
-// @desc    Delete product
-// @route   DELETE /api/products/:id
-// @access  Private (Vendor/Admin)
-const deleteProduct = async (req, res) => {
-  try {
-    const { id } = req.params;
-    const userId = req.user._id;
-
-    const product = await Product.findById(id);
-    if (!product) {
-      return res.status(404).json({
-        success: false,
-        error: 'Product not found'
-      });
-    }
-
-    // Check ownership
-    if (product.vendor.toString() !== userId.toString() && req.user.role !== 'admin') {
-      return res.status(403).json({
-        success: false,
-        error: 'Access denied. You can only delete your own products.'
-      });
-    }
-
-    // Check if product has orders
-    const Order = require('../models/Order');
-    const hasOrders = await Order.exists({ 'items.product': id });
-
-    if (hasOrders) {
-      // Archive instead of delete
-      await Product.findByIdAndUpdate(id, { status: 'archived' });
-      return res.json({
-        success: true,
-        message: 'Product archived successfully (cannot delete products with existing orders)'
-      });
-    }
-
-    // Delete product
-    await Product.findByIdAndDelete(id);
-
-    res.json({
-      success: true,
-      message: 'Product deleted successfully'
-    });
-
-  } catch (error) {
-    console.error('Delete product error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Failed to delete product'
-    });
-  }
-};
-
-// @desc    Update product inventory
-// @route   PUT /api/products/:id/inventory
-// @access  Private (Vendor/Admin)
-const updateProductInventory = async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { quantity, operation = 'set', reason = '' } = req.body;
-    const userId = req.user._id;
-
-    if (quantity === undefined) {
-      return res.status(400).json({
-        success: false,
-        error: 'Quantity is required'
-      });
-    }
-
-    const product = await Product.findById(id);
-    if (!product) {
-      return res.status(404).json({
-        success: false,
-        error: 'Product not found'
-      });
-    }
-
-    // Check ownership
-    if (product.vendor.toString() !== userId.toString() && req.user.role !== 'admin') {
-      return res.status(403).json({
-        success: false,
-        error: 'Access denied. You can only update inventory for your own products.'
-      });
-    }
-
-    const oldQuantity = product.inventory.quantity;
-
-    // Update inventory
-    await product.updateInventory(quantity, operation);
-
-    // Add history entry
-    product.history.push({
-      action: 'inventory_updated',
-      oldValue: { quantity: oldQuantity },
-      newValue: { quantity: product.inventory.quantity },
-      changedBy: userId,
-      metadata: { reason }
-    });
-
-    await product.save();
-
-    res.json({
-      success: true,
-      message: 'Product inventory updated successfully',
-      data: {
-        product: {
-          id: product._id,
-          name: product.name,
-          inventory: product.inventory,
-          history: product.history.slice(-1) // Last history entry
-        }
-      }
-    });
-
-  } catch (error) {
-    console.error('Update product inventory error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Failed to update product inventory'
-    });
-  }
-};
-
-// @desc    Add product images
-// @route   POST /api/products/:id/images
-// @access  Private (Vendor/Admin)
-const addProductImages = async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { images } = req.body;
-    const userId = req.user._id;
-
-    if (!images || !Array.isArray(images) || images.length === 0) {
-      return res.status(400).json({
-        success: false,
-        error: 'Please provide images'
-      });
-    }
-
-    const product = await Product.findById(id);
-    if (!product) {
-      return res.status(404).json({
-        success: false,
-        error: 'Product not found'
-      });
-    }
-
-    // Check ownership
-    if (product.vendor.toString() !== userId.toString() && req.user.role !== 'admin') {
-      return res.status(403).json({
-        success: false,
-        error: 'Access denied. You can only add images to your own products.'
-      });
-    }
-
-    // Check max images limit
-    const maxImages = 10;
-    if (product.images.length + images.length > maxImages) {
-      return res.status(400).json({
-        success: false,
-        error: `Maximum ${maxImages} images allowed per product`
-      });
-    }
-
-    // Process images
-    const processedImages = images.map((image, index) => ({
-      url: image.url,
-      alt: image.alt || `${product.name} - Image ${product.images.length + index + 1}`,
-      isPrimary: image.isPrimary || (product.images.length === 0 && index === 0), // First image is primary if none exists
-      order: product.images.length + index,
-      metadata: image.metadata || {}
-    }));
-
-    // Add images to product
-    product.images.push(...processedImages);
-    await product.save();
-
-    res.status(201).json({
-      success: true,
-      message: 'Images added successfully',
-      data: {
-        images: product.images.slice(-images.length) // Return only the added images
-      }
-    });
-
-  } catch (error) {
-    console.error('Add product images error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Failed to add product images'
-    });
-  }
-};
-
-// @desc    Remove product image
-// @route   DELETE /api/products/:id/images/:imageId
-// @access  Private (Vendor/Admin)
-const removeProductImage = async (req, res) => {
-  try {
-    const { id, imageId } = req.params;
-    const userId = req.user._id;
-
-    const product = await Product.findById(id);
-    if (!product) {
-      return res.status(404).json({
-        success: false,
-        error: 'Product not found'
-      });
-    }
-
-    // Check ownership
-    if (product.vendor.toString() !== userId.toString() && req.user.role !== 'admin') {
-      return res.status(403).json({
-        success: false,
-        error: 'Access denied. You can only remove images from your own products.'
-      });
-    }
-
-    // Find and remove image
-    const imageIndex = product.images.findIndex(img => img._id.toString() === imageId);
-    if (imageIndex === -1) {
-      return res.status(404).json({
-        success: false,
-        error: 'Image not found'
-      });
-    }
-
-    const removedImage = product.images.splice(imageIndex, 1)[0];
-
-    // If removed image was primary, set new primary
-    if (removedImage.isPrimary && product.images.length > 0) {
-      product.images[0].isPrimary = true;
-    }
-
-    // Update order for remaining images
-    product.images.forEach((img, index) => {
-      img.order = index;
-    });
-
-    await product.save();
-
-    res.json({
-      success: true,
-      message: 'Image removed successfully',
-      data: {
-        removedImage: {
-          id: removedImage._id,
-          url: removedImage.url,
-          alt: removedImage.alt
-        }
-      }
-    });
-
-  } catch (error) {
-    console.error('Remove product image error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Failed to remove product image'
-    });
-  }
-};
-
-// @desc    Set primary image
-// @route   PUT /api/products/:id/images/:imageId/primary
-// @access  Private (Vendor/Admin)
-const setPrimaryImage = async (req, res) => {
-  try {
-    const { id, imageId } = req.params;
-    const userId = req.user._id;
-
-    const product = await Product.findById(id);
-    if (!product) {
-      return res.status(404).json({
-        success: false,
-        error: 'Product not found'
-      });
-    }
-
-    // Check ownership
-    if (product.vendor.toString() !== userId.toString() && req.user.role !== 'admin') {
-      return res.status(403).json({
-        success: false,
-        error: 'Access denied. You can only update images for your own products.'
-      });
-    }
-
-    // Find image
-    const image = product.images.id(imageId);
-    if (!image) {
-      return res.status(404).json({
-        success: false,
-        error: 'Image not found'
-      });
-    }
-
-    // Remove primary from all images
-    product.images.forEach(img => {
-      img.isPrimary = false;
-    });
-
-    // Set new primary
-    image.isPrimary = true;
-    await product.save();
-
-    res.json({
-      success: true,
-      message: 'Primary image updated successfully',
-      data: {
-        primaryImage: {
-          id: image._id,
-          url: image.url,
-          alt: image.alt
-        }
-      }
-    });
-
-  } catch (error) {
-    console.error('Set primary image error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Failed to set primary image'
-    });
-  }
-};
-
-// @desc    Add product variant
-// @route   POST /api/products/:id/variants
-// @access  Private (Vendor/Admin)
-const addProductVariant = async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { name, type, options } = req.body;
-    const userId = req.user._id;
-
-    if (!name || !type || !options || !Array.isArray(options) || options.length === 0) {
-      return res.status(400).json({
-        success: false,
-        error: 'Please provide variant name, type, and options'
-      });
-    }
-
-    const product = await Product.findById(id);
-    if (!product) {
-      return res.status(404).json({
-        success: false,
-        error: 'Product not found'
-      });
-    }
-
-    // Check ownership
-    if (product.vendor.toString() !== userId.toString() && req.user.role !== 'admin') {
-      return res.status(403).json({
-        success: false,
-        error: 'Access denied. You can only add variants to your own products.'
-      });
-    }
-
-    // Validate variant type
-    const validTypes = ['color', 'size', 'material', 'style', 'weight', 'volume', 'other'];
-    if (!validTypes.includes(type)) {
-      return res.status(400).json({
-        success: false,
-        error: 'Invalid variant type'
-      });
-    }
-
-    // Check max variants limit
-    const maxVariants = 100;
-    if (product.variants.length >= maxVariants) {
-      return res.status(400).json({
-        success: false,
-        error: `Maximum ${maxVariants} variants allowed per product`
-      });
-    }
-
-    // Process options
-    const processedOptions = options.map(option => ({
-      value: sanitizeInput(option.value),
-      priceModifier: option.priceModifier ? parseFloat(option.priceModifier) : 0,
-      sku: option.sku ? sanitizeInput(option.sku) : undefined,
-      inventory: {
-        quantity: option.inventory?.quantity ? parseInt(option.inventory.quantity) : 0,
-        sku: option.inventory?.sku ? sanitizeInput(option.inventory.sku) : undefined
-      }
-    }));
-
-    // Create variant
-    const variant = {
-      name: sanitizeInput(name),
-      type,
-      options: processedOptions
+    // Sorting
+    let sort = {};
+    const sortOptions = {
+      'price': { price: sortOrder === 'desc' ? -1 : 1 },
+      'rating': { 'rating.average': sortOrder === 'desc' ? -1 : 1 },
+      'newest': { createdAt: sortOrder === 'desc' ? -1 : 1 },
+      'popular': { 'stats.views': sortOrder === 'desc' ? -1 : 1 },
+      'bestselling': { 'stats.salesCount': sortOrder === 'desc' ? -1 : 1 },
+      'name': { name: sortOrder === 'desc' ? -1 : 1 }
     };
 
-    product.variants.push(variant);
-    await product.save();
-
-    res.status(201).json({
-      success: true,
-      message: 'Variant added successfully',
-      data: {
-        variant: product.variants[product.variants.length - 1]
-      }
-    });
-
-  } catch (error) {
-    console.error('Add product variant error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Failed to add product variant'
-    });
-  }
-};
-
-// @desc    Update product variant
-// @route   PUT /api/products/:id/variants/:variantId
-// @access  Private (Vendor/Admin)
-const updateProductVariant = async (req, res) => {
-  try {
-    const { id, variantId } = req.params;
-    const updates = req.body;
-    const userId = req.user._id;
-
-    const product = await Product.findById(id);
-    if (!product) {
-      return res.status(404).json({
-        success: false,
-        error: 'Product not found'
-      });
+    if (sortOptions[sortBy]) {
+      sort = sortOptions[sortBy];
+    } else {
+      sort = { createdAt: -1 };
     }
 
-    // Check ownership
-    if (product.vendor.toString() !== userId.toString() && req.user.role !== 'admin') {
-      return res.status(403).json({
-        success: false,
-        error: 'Access denied. You can only update variants for your own products.'
-      });
+    // Populate options
+    let populateOptions = [
+      { path: 'vendor', select: 'firstName lastName' },
+      { path: 'store', select: 'name slug' },
+      { path: 'category', select: 'name slug' }
+    ];
+
+    if (includeVariants) {
+      populateOptions.push({ path: 'variants' });
     }
 
-    // Find variant
-    const variant = product.variants.id(variantId);
-    if (!variant) {
-      return res.status(404).json({
-        success: false,
-        error: 'Variant not found'
-      });
-    }
-
-    // Update variant
-    if (updates.name) variant.name = sanitizeInput(updates.name);
-    if (updates.type) {
-      const validTypes = ['color', 'size', 'material', 'style', 'weight', 'volume', 'other'];
-      if (!validTypes.includes(updates.type)) {
-        return res.status(400).json({
-          success: false,
-          error: 'Invalid variant type'
-        });
-      }
-      variant.type = updates.type;
-    }
-
-    // Update options if provided
-    if (updates.options && Array.isArray(updates.options)) {
-      variant.options = updates.options.map(option => ({
-        value: sanitizeInput(option.value),
-        priceModifier: option.priceModifier ? parseFloat(option.priceModifier) : 0,
-        sku: option.sku ? sanitizeInput(option.sku) : undefined,
-        inventory: {
-          quantity: option.inventory?.quantity ? parseInt(option.inventory.quantity) : 0,
-          sku: option.inventory?.sku ? sanitizeInput(option.inventory.sku) : undefined
-        }
-      }));
-    }
-
-    await product.save();
-
-    res.json({
-      success: true,
-      message: 'Variant updated successfully',
-      data: {
-        variant
-      }
-    });
-
-  } catch (error) {
-    console.error('Update product variant error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Failed to update product variant'
-    });
-  }
-};
-
-// @desc    Remove product variant
-// @route   DELETE /api/products/:id/variants/:variantId
-// @access  Private (Vendor/Admin)
-const removeProductVariant = async (req, res) => {
-  try {
-    const { id, variantId } = req.params;
-    const userId = req.user._id;
-
-    const product = await Product.findById(id);
-    if (!product) {
-      return res.status(404).json({
-        success: false,
-        error: 'Product not found'
-      });
-    }
-
-    // Check ownership
-    if (product.vendor.toString() !== userId.toString() && req.user.role !== 'admin') {
-      return res.status(403).json({
-        success: false,
-        error: 'Access denied. You can only remove variants from your own products.'
-      });
-    }
-
-    // Find and remove variant
-    const variantIndex = product.variants.findIndex(v => v._id.toString() === variantId);
-    if (variantIndex === -1) {
-      return res.status(404).json({
-        success: false,
-        error: 'Variant not found'
-      });
-    }
-
-    const removedVariant = product.variants.splice(variantIndex, 1)[0];
-    await product.save();
-
-    res.json({
-      success: true,
-      message: 'Variant removed successfully',
-      data: {
-        removedVariant: {
-          id: removedVariant._id,
-          name: removedVariant.name,
-          type: removedVariant.type
-        }
-      }
-    });
-
-  } catch (error) {
-    console.error('Remove product variant error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Failed to remove product variant'
-    });
-  }
-};
-
-// @desc    Get product reviews
-// @route   GET /api/products/:id/reviews
-// @access  Public
-const getProductReviews = async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { page = 1, limit = 10, rating, verified = false, sortBy = 'createdAt', sortOrder = 'desc' } = req.query;
-
-    const product = await Product.findById(id);
-    if (!product) {
-      return res.status(404).json({
-        success: false,
-        error: 'Product not found'
-      });
-    }
-
-    // Build query
-    let query = { product: id };
-
-    if (rating) {
-      query.rating = parseInt(rating);
-    }
-
-    if (verified === 'true') {
-      query.verified = true;
-    }
-
-    // Build sort object
-    const sort = {};
-    sort[sortBy] = sortOrder === 'desc' ? -1 : 1;
-
-    const reviews = await Review.find(query)
-      .populate('user', 'firstName lastName profile.avatar')
+    // Execute query
+    const products = await Product.find(query)
+      .populate(populateOptions)
       .sort(sort)
       .limit(limit * 1)
       .skip((page - 1) * limit);
 
-    const total = await Review.countDocuments(query);
+    const total = await Product.countDocuments(query);
 
-    // Get rating distribution
-    const ratingDistribution = await Review.aggregate([
-      { $match: { product: product._id } },
+    // Get additional data if requested
+    let enhancedProducts = products;
+
+    if (includeAnalytics) {
+      enhancedProducts = await Promise.all(products.map(async (product) => {
+        const analytics = await this.getProductAnalytics(product._id);
+        return { ...product.toObject(), analytics };
+      }));
+    }
+
+    res.status(200).json({
+      success: true,
+      data: {
+        products: enhancedProducts,
+        pagination: {
+          currentPage: parseInt(page),
+          totalPages: Math.ceil(total / limit),
+          totalProducts: total,
+          hasNext: page < Math.ceil(total / limit),
+          hasPrev: page > 1,
+          limit: parseInt(limit)
+        },
+        filters: {
+          applied: {
+            category,
+            vendor,
+            store,
+            search,
+            minPrice,
+            maxPrice,
+            rating,
+            inStock,
+            featured,
+            brand,
+            tags
+          }
+        }
+      }
+    });
+  });
+
+  // Get product by ID or slug
+  getProduct = catchAsync(async (req, res) => {
+    const { id } = req.params;
+    const { includeReviews = false, includeRelated = false, trackView = true } = req.query;
+
+    // Find product by ID or slug
+    let product;
+    if (mongoose.Types.ObjectId.isValid(id)) {
+      product = await Product.findById(id);
+    } else {
+      product = await Product.findOne({ slug: id });
+    }
+
+    if (!product) {
+      throw new AppError('Product not found', 404, true, 'PRODUCT_NOT_FOUND');
+    }
+
+    // Check if product is accessible
+    if (product.status !== 'published' && product.vendor.toString() !== req.user?.id) {
+      throw new AppError('Product not available', 404, true, 'PRODUCT_NOT_AVAILABLE');
+    }
+
+    // Track view if requested
+    if (trackView) {
+      await product.addView();
+    }
+
+    // Populate related data
+    const populateOptions = [
+      { path: 'vendor', select: 'firstName lastName store' },
+      { path: 'store', select: 'name slug logo' },
+      { path: 'category', select: 'name slug icon' },
+      { path: 'subcategories', select: 'name slug' }
+    ];
+
+    await product.populate(populateOptions);
+
+    // Get reviews if requested
+    let reviews = [];
+    if (includeReviews === 'true') {
+      reviews = await Review.findByProduct(product._id, {
+        limit: 10,
+        sortBy: 'helpful'
+      });
+    }
+
+    // Get related products if requested
+    let relatedProducts = [];
+    if (includeRelated === 'true') {
+      relatedProducts = await this.getRelatedProducts(product._id);
+    }
+
+    // Get product recommendations
+    const recommendations = await this.getProductRecommendations(product._id, req.user?.id);
+
+    res.status(200).json({
+      success: true,
+      data: {
+        product,
+        reviews: reviews || [],
+        relatedProducts: relatedProducts || [],
+        recommendations: recommendations || [],
+        meta: {
+          viewCount: product.stats.views,
+          salesCount: product.stats.salesCount,
+          wishlistCount: product.stats.wishlistCount,
+          lastViewed: product.stats.lastViewed
+        }
+      }
+    });
+  });
+
+  // Update product
+  updateProduct = catchAsync(async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({
+        error: 'Validation failed',
+        details: errors.array()
+      });
+    }
+
+    const { id } = req.params;
+    const updates = req.body;
+
+    const product = await Product.findById(id);
+
+    if (!product) {
+      throw new AppError('Product not found', 404, true, 'PRODUCT_NOT_FOUND');
+    }
+
+    // Check permissions
+    if (product.vendor.toString() !== req.user.id && req.user.role !== 'admin') {
+      throw new AppError('Not authorized to update this product', 403, true, 'NOT_AUTHORIZED');
+    }
+
+    // Track changes for history
+    const oldProduct = product.toObject();
+    const changes = [];
+
+    // Handle image updates
+    if (req.files && req.files.images) {
+      const imageFiles = Array.isArray(req.files.images) ? req.files.images : [req.files.images];
+
+      for (const file of imageFiles) {
+        const result = await cloudinary.uploader.upload(file.path, {
+          folder: `products/${product.store}`,
+          quality: 'auto',
+          format: 'webp'
+        });
+
+        product.images.push({
+          url: result.secure_url,
+          public_id: result.public_id,
+          thumbnail: result.secure_url.replace('/upload/', '/upload/w_300,h_300,c_fill/'),
+          alt: `${product.name} - ${product.store.name}`,
+          uploadedAt: new Date()
+        });
+      }
+    }
+
+    // Handle image deletions
+    if (req.body.deletedImages) {
+      const deletedImages = JSON.parse(req.body.deletedImages);
+
+      for (const imageId of deletedImages) {
+        const image = product.images.id(imageId);
+        if (image) {
+          // Delete from Cloudinary
+          await cloudinary.uploader.destroy(image.public_id);
+          // Remove from product
+          product.images.pull(imageId);
+        }
+      }
+    }
+
+    // Update allowed fields
+    const allowedFields = [
+      'name', 'description', 'shortDescription', 'category', 'subcategories',
+      'tags', 'price', 'compareAtPrice', 'costPrice', 'currency',
+      'variants', 'attributes', 'inventory', 'shipping', 'seo', 'options',
+      'customFields', 'status', 'featured'
+    ];
+
+    allowedFields.forEach(field => {
+      if (updates[field] !== undefined) {
+        const oldValue = product[field];
+        const newValue = updates[field];
+
+        if (JSON.stringify(oldValue) !== JSON.stringify(newValue)) {
+          changes.push({
+            field,
+            oldValue,
+            newValue,
+            changedAt: new Date(),
+            changedBy: req.user.id
+          });
+        }
+
+        product[field] = newValue;
+      }
+    });
+
+    // Update version history
+    if (changes.length > 0) {
+      product.versions.push({
+        version: (product.versions.length || 0) + 1,
+        changes,
+        createdAt: new Date()
+      });
+    }
+
+    product.updatedAt = new Date();
+    product.updatedBy = req.user.id;
+
+    await product.save();
+
+    // Update related data
+    if (updates.category && updates.category !== oldProduct.category?.toString()) {
+      // Update old category stats
+      if (oldProduct.category) {
+        const oldCategory = await Category.findById(oldProduct.category);
+        if (oldCategory) await oldCategory.updateStats();
+      }
+
+      // Update new category stats
+      const newCategory = await Category.findById(updates.category);
+      if (newCategory) await newCategory.updateStats();
+    }
+
+    // Update store analytics
+    const store = await Store.findById(product.store);
+    if (store) await store.updateAnalytics();
+
+    // Send notification
+    await Notification.createNotification(product.vendor, {
+      type: 'product',
+      category: 'informational',
+      title: 'Product Updated',
+      message: `Your product "${product.name}" has been updated.`,
+      data: {
+        productId: product._id,
+        productName: product.name,
+        changes: changes.length
+      },
+      priority: 'low'
+    });
+
+    logger.info('Product updated', {
+      productId: product._id,
+      userId: req.user.id,
+      changes: changes.length
+    });
+
+    res.status(200).json({
+      success: true,
+      message: 'Product updated successfully',
+      data: {
+        product,
+        changes: changes.length
+      }
+    });
+  });
+
+  // Delete product
+  deleteProduct = catchAsync(async (req, res) => {
+    const { id } = req.params;
+    const { permanent = false } = req.query;
+
+    const product = await Product.findById(id);
+
+    if (!product) {
+      throw new AppError('Product not found', 404, true, 'PRODUCT_NOT_FOUND');
+    }
+
+    // Check permissions
+    if (product.vendor.toString() !== req.user.id && req.user.role !== 'admin') {
+      throw new AppError('Not authorized to delete this product', 403, true, 'NOT_AUTHORIZED');
+    }
+
+    if (permanent === 'true') {
+      // Permanent deletion
+      // Delete images from Cloudinary
+      for (const image of product.images) {
+        await cloudinary.uploader.destroy(image.public_id);
+      }
+
+      await Product.findByIdAndDelete(id);
+
+      // Update category stats
+      const category = await Category.findById(product.category);
+      if (category) await category.updateStats();
+
+      // Update store stats
+      const store = await Store.findById(product.store);
+      if (store) await store.updateAnalytics();
+
+      logger.info('Product permanently deleted', {
+        productId: id,
+        userId: req.user.id
+      });
+    } else {
+      // Soft deletion
+      product.isDeleted = true;
+      product.deletedAt = new Date();
+      product.deletedBy = req.user.id;
+      await product.save();
+
+      // Archive product
+      await product.archive();
+
+      logger.info('Product soft deleted', {
+        productId: id,
+        userId: req.user.id
+      });
+    }
+
+    res.status(200).json({
+      success: true,
+      message: permanent === 'true' ? 'Product permanently deleted' : 'Product deleted successfully'
+    });
+  });
+
+  // ===============================
+  // ADVANCED SEARCH & FILTERING
+  // ===============================
+
+  // Advanced search
+  advancedSearch = catchAsync(async (req, res) => {
+    const {
+      q: searchTerm,
+      category,
+      subcategory,
+      brand,
+      priceMin,
+      priceMax,
+      rating,
+      inStock,
+      freeShipping,
+      onSale,
+      vendor,
+      location,
+      attributes,
+      sortBy = 'relevance',
+      page = 1,
+      limit = 20
+    } = req.query;
+
+    // Build search query
+    let searchQuery = { status: 'published', isDeleted: false };
+
+    // Text search
+    if (searchTerm) {
+      searchQuery.$text = { $search: searchTerm };
+    }
+
+    // Category filter
+    if (category) {
+      searchQuery.category = category;
+    }
+
+    // Subcategory filter
+    if (subcategory) {
+      searchQuery.subcategories = subcategory;
+    }
+
+    // Brand filter
+    if (brand) {
+      searchQuery.brand = { $regex: brand, $options: 'i' };
+    }
+
+    // Price range
+    if (priceMin || priceMax) {
+      searchQuery.price = {};
+      if (priceMin) searchQuery.price.$gte = parseFloat(priceMin);
+      if (priceMax) searchQuery.price.$lte = parseFloat(priceMax);
+    }
+
+    // Rating filter
+    if (rating) {
+      searchQuery['rating.average'] = { $gte: parseFloat(rating) };
+    }
+
+    // Stock filter
+    if (inStock === 'true') {
+      searchQuery['inventory.stockStatus'] = 'in_stock';
+    }
+
+    // Sale filter
+    if (onSale === 'true') {
+      searchQuery.compareAtPrice = { $exists: true, $gt: '$price' };
+    }
+
+    // Free shipping filter
+    if (freeShipping === 'true') {
+      searchQuery['shipping.freeShipping'] = true;
+    }
+
+    // Vendor filter
+    if (vendor) {
+      searchQuery.vendor = vendor;
+    }
+
+    // Attributes filter
+    if (attributes) {
+      const attributeFilters = JSON.parse(attributes);
+      Object.keys(attributeFilters).forEach(attr => {
+        searchQuery[`attributes.${attr}`] = attributeFilters[attr];
+      });
+    }
+
+    // Sorting
+    let sort = {};
+    switch (sortBy) {
+      case 'price_asc':
+        sort = { price: 1 };
+        break;
+      case 'price_desc':
+        sort = { price: -1 };
+        break;
+      case 'rating':
+        sort = { 'rating.average': -1 };
+        break;
+      case 'newest':
+        sort = { createdAt: -1 };
+        break;
+      case 'popular':
+        sort = { 'stats.views': -1 };
+        break;
+      case 'bestselling':
+        sort = { 'stats.salesCount': -1 };
+        break;
+      case 'relevance':
+      default:
+        if (searchTerm) {
+          sort = { score: { $meta: 'textScore' } };
+        } else {
+          sort = { createdAt: -1 };
+        }
+    }
+
+    const products = await Product.find(searchQuery)
+      .populate('vendor', 'firstName lastName')
+      .populate('store', 'name slug')
+      .populate('category', 'name slug')
+      .sort(sort)
+      .limit(limit * 1)
+      .skip((page - 1) * limit);
+
+    const total = await Product.countDocuments(searchQuery);
+
+    // Get search suggestions
+    const suggestions = await this.getSearchSuggestions(searchTerm);
+
+    // Get search analytics
+    const analytics = await this.getSearchAnalytics(searchTerm);
+
+    res.status(200).json({
+      success: true,
+      data: {
+        products,
+        suggestions,
+        analytics,
+        pagination: {
+          currentPage: parseInt(page),
+          totalPages: Math.ceil(total / limit),
+          totalProducts: total,
+          hasNext: page < Math.ceil(total / limit),
+          hasPrev: page > 1
+        }
+      }
+    });
+  });
+
+  // Get search suggestions
+  async getSearchSuggestions(searchTerm) {
+    if (!searchTerm || searchTerm.length < 2) return [];
+
+    const suggestions = await Product.aggregate([
+      {
+        $match: {
+          status: 'published',
+          isDeleted: false,
+          $or: [
+            { name: { $regex: searchTerm, $options: 'i' } },
+            { brand: { $regex: searchTerm, $options: 'i' } },
+            { tags: { $in: [new RegExp(searchTerm, 'i')] } }
+          ]
+        }
+      },
       {
         $group: {
-          _id: '$rating',
-          count: { $sum: 1 }
+          _id: null,
+          suggestions: { $addToSet: '$name' },
+          brands: { $addToSet: '$brand' },
+          categories: { $addToSet: '$category' }
         }
       }
     ]);
 
-    res.json({
-      success: true,
-      data: {
-        reviews,
-        pagination: {
-          page: parseInt(page),
-          limit: parseInt(limit),
-          total,
-          pages: Math.ceil(total / limit)
-        },
-        ratingDistribution,
-        averageRating: product.rating.average,
-        totalReviews: product.rating.count
-      }
-    });
-
-  } catch (error) {
-    console.error('Get product reviews error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Failed to fetch product reviews'
-    });
+    return suggestions[0] || { suggestions: [], brands: [], categories: [] };
   }
-};
 
-// @desc    Add product review
-// @route   POST /api/products/:id/reviews
-// @access  Private
-const addProductReview = async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { rating, title, comment, images, verified } = req.body;
-    const userId = req.user._id;
+  // Get search analytics
+  async getSearchAnalytics(searchTerm) {
+    // Implementation for search analytics
+    return {
+      totalSearches: 0,
+      popularSearches: [],
+      noResults: 0
+    };
+  }
 
-    if (!rating || !title || !comment) {
-      return res.status(400).json({
-        success: false,
-        error: 'Please provide rating, title, and comment'
-      });
-    }
+  // ===============================
+  // PRODUCT VARIANTS MANAGEMENT
+  // ===============================
 
-    if (rating < 1 || rating > 5) {
-      return res.status(400).json({
-        success: false,
-        error: 'Rating must be between 1 and 5'
-      });
-    }
+  // Create product variant
+  createVariant = catchAsync(async (req, res) => {
+    const { productId } = req.params;
+    const { name, type, values } = req.body;
 
-    const product = await Product.findById(id);
+    const product = await Product.findById(productId);
+
     if (!product) {
-      return res.status(404).json({
-        success: false,
-        error: 'Product not found'
-      });
+      throw new AppError('Product not found', 404, true, 'PRODUCT_NOT_FOUND');
     }
 
-    // Check if user already reviewed this product
-    const existingReview = await Review.findOne({ product: id, user: userId });
-    if (existingReview) {
-      return res.status(400).json({
-        success: false,
-        error: 'You have already reviewed this product'
-      });
+    // Check permissions
+    if (product.vendor.toString() !== req.user.id && req.user.role !== 'admin') {
+      throw new AppError('Not authorized to modify this product', 403, true, 'NOT_AUTHORIZED');
     }
 
-    // Check if user has purchased this product
-    const Order = require('../models/Order');
-    const hasPurchased = await Order.exists({
-      user: userId,
-      'items.product': id,
-      status: 'delivered'
+    // Add variant
+    await product.createVariant({
+      name,
+      type,
+      values
     });
 
-    // Create review
-    const review = await Review.create({
-      product: id,
-      user: userId,
-      rating: parseInt(rating),
-      title: sanitizeInput(title),
-      comment: sanitizeInput(comment),
-      images: images || [],
-      verified: hasPurchased || false,
-      helpful: 0,
-      notHelpful: 0
+    await product.save();
+
+    logger.info('Product variant created', {
+      productId,
+      variantName: name,
+      userId: req.user.id
     });
 
-    // Update product rating
-    await product.addReview(rating, 1);
-
-    // Populate user data
-    await review.populate('user', 'firstName lastName profile.avatar');
-
-    res.status(201).json({
+    res.status(200).json({
       success: true,
-      message: 'Review added successfully',
-      data: {
-        review
+      message: 'Variant created successfully',
+      data: product.variants
+    });
+  });
+
+  // Update product variant
+  updateVariant = catchAsync(async (req, res) => {
+    const { productId, variantId } = req.params;
+    const updates = req.body;
+
+    const product = await Product.findById(productId);
+
+    if (!product) {
+      throw new AppError('Product not found', 404, true, 'PRODUCT_NOT_FOUND');
+    }
+
+    // Find and update variant
+    const variant = product.variants.id(variantId);
+    if (!variant) {
+      throw new AppError('Variant not found', 404, true, 'VARIANT_NOT_FOUND');
+    }
+
+    Object.keys(updates).forEach(key => {
+      if (updates[key] !== undefined) {
+        variant[key] = updates[key];
       }
     });
 
-  } catch (error) {
-    console.error('Add product review error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Failed to add review'
+    await product.save();
+
+    logger.info('Product variant updated', {
+      productId,
+      variantId,
+      userId: req.user.id
     });
-  }
-};
 
-// @desc    Update product review
-// @route   PUT /api/products/:id/reviews/:reviewId
-// @access  Private
-const updateProductReview = async (req, res) => {
-  try {
-    const { id, reviewId } = req.params;
-    const { rating, title, comment, images } = req.body;
-    const userId = req.user._id;
-
-    const review = await Review.findById(reviewId);
-    if (!review) {
-      return res.status(404).json({
-        success: false,
-        error: 'Review not found'
-      });
-    }
-
-    if (review.user.toString() !== userId.toString()) {
-      return res.status(403).json({
-        success: false,
-        error: 'Access denied. You can only update your own reviews.'
-      });
-    }
-
-    if (review.product.toString() !== id.toString()) {
-      return res.status(400).json({
-        success: false,
-        error: 'Review does not belong to this product'
-      });
-    }
-
-    // Store old rating for recalculation
-    const oldRating = review.rating;
-
-    // Update review
-    if (rating) review.rating = parseInt(rating);
-    if (title) review.title = sanitizeInput(title);
-    if (comment) review.comment = sanitizeInput(comment);
-    if (images) review.images = images;
-
-    await review.save();
-
-    // Update product rating if rating changed
-    if (oldRating !== review.rating) {
-      const product = await Product.findById(id);
-      // Recalculate average rating
-      const allReviews = await Review.find({ product: id });
-      const newAverage = allReviews.reduce((sum, r) => sum + r.rating, 0) / allReviews.length;
-      
-      product.rating.average = Math.round(newAverage * 10) / 10;
-      await product.save();
-    }
-
-    res.json({
+    res.status(200).json({
       success: true,
-      message: 'Review updated successfully',
-      data: {
-        review
-      }
+      message: 'Variant updated successfully',
+      data: variant
+    });
+  });
+
+  // Delete product variant
+  deleteVariant = catchAsync(async (req, res) => {
+    const { productId, variantId } = req.params;
+
+    const product = await Product.findById(productId);
+
+    if (!product) {
+      throw new AppError('Product not found', 404, true, 'PRODUCT_NOT_FOUND');
+    }
+
+    // Remove variant
+    product.variants.pull(variantId);
+    await product.save();
+
+    logger.info('Product variant deleted', {
+      productId,
+      variantId,
+      userId: req.user.id
     });
 
-  } catch (error) {
-    console.error('Update product review error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Failed to update review'
+    res.status(200).json({
+      success: true,
+      message: 'Variant deleted successfully'
     });
-  }
-};
+  });
 
-// @desc    Delete product review
-// @route   DELETE /api/products/:id/reviews/:reviewId
-// @access  Private
-const deleteProductReview = async (req, res) => {
-  try {
-    const { id, reviewId } = req.params;
-    const userId = req.user._id;
+  // ===============================
+  // INVENTORY MANAGEMENT
+  // ===============================
 
-    const review = await Review.findById(reviewId);
-    if (!review) {
-      return res.status(404).json({
-        success: false,
-        error: 'Review not found'
-      });
+  // Update inventory
+  updateInventory = catchAsync(async (req, res) => {
+    const { productId } = req.params;
+    const { quantity, reason, notes } = req.body;
+
+    const product = await Product.findById(productId);
+
+    if (!product) {
+      throw new AppError('Product not found', 404, true, 'PRODUCT_NOT_FOUND');
     }
 
-    if (review.user.toString() !== userId.toString() && req.user.role !== 'admin') {
-      return res.status(403).json({
-        success: false,
-        error: 'Access denied. You can only delete your own reviews.'
-      });
+    // Check permissions
+    if (product.vendor.toString() !== req.user.id && req.user.role !== 'admin') {
+      throw new AppError('Not authorized to update inventory', 403, true, 'NOT_AUTHORIZED');
     }
 
-    if (review.product.toString() !== id.toString()) {
-      return res.status(400).json({
-        success: false,
-        error: 'Review does not belong to this product'
-      });
-    }
+    const oldQuantity = product.inventory.quantity;
+    const quantityDiff = quantity - oldQuantity;
 
-    // Delete review
-    await Review.findByIdAndDelete(reviewId);
+    // Update inventory
+    product.inventory.quantity = quantity;
 
-    // Update product rating
-    const product = await Product.findById(id);
-    const remainingReviews = await Review.find({ product: id });
-    
-    if (remainingReviews.length > 0) {
-      const newAverage = remainingReviews.reduce((sum, r) => sum + r.rating, 0) / remainingReviews.length;
-      product.rating.average = Math.round(newAverage * 10) / 10;
-      product.rating.count = remainingReviews.length;
+    // Update stock status
+    if (quantity <= 0) {
+      product.inventory.stockStatus = product.inventory.allowBackorders ? 'pre_order' : 'out_of_stock';
+    } else if (quantity <= product.inventory.lowStockThreshold) {
+      product.inventory.stockStatus = 'low_stock';
     } else {
-      product.rating.average = 0;
-      product.rating.count = 0;
+      product.inventory.stockStatus = 'in_stock';
     }
 
     await product.save();
 
-    res.json({
-      success: true,
-      message: 'Review deleted successfully'
+    // Add inventory history
+    await this.addInventoryHistory(productId, {
+      oldQuantity,
+      newQuantity: quantity,
+      difference: quantityDiff,
+      reason,
+      notes,
+      updatedBy: req.user.id
     });
 
-  } catch (error) {
-    console.error('Delete product review error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Failed to delete review'
-    });
-  }
-};
-
-// @desc    Mark review as helpful
-// @route   POST /api/products/:id/reviews/:reviewId/helpful
-// @access  Private
-const markReviewHelpful = async (req, res) => {
-  try {
-    const { id, reviewId } = req.params;
-    const userId = req.user._id;
-
-    const review = await Review.findById(reviewId);
-    if (!review) {
-      return res.status(404).json({
-        success: false,
-        error: 'Review not found'
-      });
-    }
-
-    if (review.product.toString() !== id.toString()) {
-      return res.status(400).json({
-        success: false,
-        error: 'Review does not belong to this product'
-      });
-    }
-
-    // Check if user already marked as helpful
-    if (review.helpfulUsers && review.helpfulUsers.includes(userId)) {
-      return res.status(400).json({
-        success: false,
-        error: 'You have already marked this review as helpful'
-      });
-    }
-
-    // Add user to helpful users
-    if (!review.helpfulUsers) {
-      review.helpfulUsers = [];
-    }
-    review.helpfulUsers.push(userId);
-    review.helpful += 1;
-
-    await review.save();
-
-    res.json({
-      success: true,
-      message: 'Review marked as helpful',
-      data: {
-        helpful: review.helpful,
-        notHelpful: review.notHelpful
-      }
-    });
-
-  } catch (error) {
-    console.error('Mark review helpful error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Failed to mark review as helpful'
-    });
-  }
-};
-
-// @desc    Get featured products
-// @route   GET /api/products/featured
-// @access  Public
-const getFeaturedProducts = async (req, res) => {
-  try {
-    const { limit = 20, category } = req.query;
-
-    let query = {
-      status: 'active',
-      visibility: 'public',
-      featured: true
-    };
-
-    if (category) {
-      query.category = category;
-    }
-
-    const products = await Product.find(query)
-      .populate('category', 'name slug')
-      .populate('vendor', 'firstName lastName businessName')
-      .sort({ 'statistics.views': -1 })
-      .limit(parseInt(limit))
-      .select('name slug sku price images rating category vendor featured trending');
-
-    res.json({
-      success: true,
-      data: {
-        products,
-        count: products.length
-      }
-    });
-
-  } catch (error) {
-    console.error('Get featured products error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Failed to fetch featured products'
-    });
-  }
-};
-
-// @desc    Get trending products
-// @route   GET /api/products/trending
-// @access  Public
-const getTrendingProducts = async (req, res) => {
-  try {
-    const { limit = 20, category } = req.query;
-
-    let query = {
-      status: 'active',
-      visibility: 'public',
-      trending: true
-    };
-
-    if (category) {
-      query.category = category;
-    }
-
-    const products = await Product.find(query)
-      .populate('category', 'name slug')
-      .populate('vendor', 'firstName lastName businessName')
-      .sort({ 'statistics.views': -1 })
-      .limit(parseInt(limit))
-      .select('name slug sku price images rating category vendor featured trending');
-
-    res.json({
-      success: true,
-      data: {
-        products,
-        count: products.length
-      }
-    });
-
-  } catch (error) {
-    console.error('Get trending products error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Failed to fetch trending products'
-    });
-  }
-};
-
-// @desc    Get products by category
-// @route   GET /api/products/category/:categoryId
-// @access  Public
-const getProductsByCategory = async (req, res) => {
-  try {
-    const { categoryId } = req.params;
-    const {
-      page = 1,
-      limit = 20,
-      subcategory,
-      sortBy = 'createdAt',
-      sortOrder = 'desc'
-    } = req.query;
-
-    const category = await Category.findById(categoryId);
-    if (!category) {
-      return res.status(404).json({
-        success: false,
-        error: 'Category not found'
-      });
-    }
-
-    // Build query
-    let query = {
-      status: 'active',
-      visibility: 'public'
-    };
-
-    if (subcategory) {
-      query.subCategory = subcategory;
-    } else {
-      // Get products from category and all its subcategories
-      const subcategories = await Category.find({ parent: categoryId }).select('_id');
-      const subcategoryIds = subcategories.map(sub => sub._id);
-      
-      query.$or = [
-        { category: categoryId },
-        { subCategory: { $in: subcategoryIds } }
-      ];
-    }
-
-    // Build sort object
-    const sort = {};
-    sort[sortBy] = sortOrder === 'desc' ? -1 : 1;
-
-    const products = await Product.find(query)
-      .populate('category', 'name slug')
-      .populate('subCategory', 'name slug')
-      .populate('vendor', 'firstName lastName businessName')
-      .sort(sort)
-      .limit(limit * 1)
-      .skip((page - 1) * limit)
-      .select('name slug sku price images rating category subCategory vendor featured trending createdAt');
-
-    const total = await Product.countDocuments(query);
-
-    // Get subcategories for filter
-    const subcategories = await Category.find({ parent: categoryId })
-      .select('name slug')
-      .sort({ name: 1 });
-
-    res.json({
-      success: true,
-      data: {
-        category: {
-          id: category._id,
-          name: category.name,
-          slug: category.slug,
-          description: category.description
+    // Send notifications
+    if (quantity <= product.inventory.lowStockThreshold && oldQuantity > product.inventory.lowStockThreshold) {
+      await Notification.createNotification(product.vendor, {
+        type: 'product',
+        category: 'informational',
+        title: 'Low Stock Alert',
+        message: `Your product "${product.name}" is running low on stock (${quantity} remaining).`,
+        data: {
+          productId: product._id,
+          productName: product.name,
+          quantity
         },
-        products,
-        subcategories,
+        priority: 'high',
+        actions: [
+          {
+            type: 'link',
+            label: 'Update Inventory',
+            url: `/vendor/products/${product._id}/inventory`,
+            action: 'update_inventory'
+          }
+        ]
+      });
+    }
+
+    logger.info('Product inventory updated', {
+      productId,
+      oldQuantity,
+      newQuantity: quantity,
+      userId: req.user.id
+    });
+
+    res.status(200).json({
+      success: true,
+      message: 'Inventory updated successfully',
+      data: {
+        product: product._id,
+        oldQuantity,
+        newQuantity: quantity,
+        stockStatus: product.inventory.stockStatus
+      }
+    });
+  });
+
+  // Get inventory history
+  getInventoryHistory = catchAsync(async (req, res) => {
+    const { productId } = req.params;
+    const { page = 1, limit = 20 } = req.query;
+
+    // This would typically be stored in a separate collection
+    // For now, return mock data
+    const history = [
+      {
+        date: new Date(),
+        oldQuantity: 100,
+        newQuantity: 95,
+        difference: -5,
+        reason: 'Sale',
+        notes: 'Order #12345'
+      }
+    ];
+
+    res.status(200).json({
+      success: true,
+      data: {
+        history,
         pagination: {
-          page: parseInt(page),
-          limit: parseInt(limit),
-          total,
-          pages: Math.ceil(total / limit)
+          currentPage: 1,
+          totalPages: 1,
+          totalItems: history.length
         }
       }
     });
+  });
 
-  } catch (error) {
-    console.error('Get products by category error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Failed to fetch products by category'
-    });
+  // Add inventory history entry
+  async addInventoryHistory(productId, historyData) {
+    // Implementation for inventory history tracking
+    logger.info('Inventory history added', { productId, ...historyData });
   }
-};
 
-// @desc    Get products by vendor
-// @route   GET /api/products/vendor/:vendorId
-// @access  Public
-const getProductsByVendor = async (req, res) => {
-  try {
-    const { vendorId } = req.params;
-    const {
-      page = 1,
-      limit = 20,
-      category,
-      sortBy = 'createdAt',
-      sortOrder = 'desc'
-    } = req.query;
+  // ===============================
+  // PRODUCT ANALYTICS
+  // ===============================
 
-    const vendor = await User.findById(vendorId);
-    if (!vendor || vendor.role !== 'vendor') {
-      return res.status(404).json({
-        success: false,
-        error: 'Vendor not found'
-      });
+  // Get product analytics
+  getProductAnalytics = catchAsync(async (req, res) => {
+    const { productId } = req.params;
+    const { dateRange = 30 } = req.query;
+
+    const product = await Product.findById(productId);
+
+    if (!product) {
+      throw new AppError('Product not found', 404, true, 'PRODUCT_NOT_FOUND');
     }
 
-    // Build query
-    let query = {
-      vendor: vendorId,
-      status: 'active',
-      visibility: 'public'
-    };
-
-    if (category) {
-      query.category = category;
+    // Check permissions
+    if (product.vendor.toString() !== req.user.id && req.user.role !== 'admin') {
+      throw new AppError('Not authorized to view analytics', 403, true, 'NOT_AUTHORIZED');
     }
 
-    // Build sort object
-    const sort = {};
-    sort[sortBy] = sortOrder === 'desc' ? -1 : 1;
+    const analytics = await this.generateProductAnalytics(productId, parseInt(dateRange));
 
-    const products = await Product.find(query)
-      .populate('category', 'name slug')
-      .populate('subCategory', 'name slug')
-      .sort(sort)
-      .limit(limit * 1)
-      .skip((page - 1) * limit)
-      .select('name slug sku price images rating category subCategory featured trending createdAt');
-
-    const total = await Product.countDocuments(query);
-
-    res.json({
+    res.status(200).json({
       success: true,
-      data: {
-        vendor: {
-          id: vendor._id,
-          firstName: vendor.firstName,
-          lastName: vendor.lastName,
-          businessName: vendor.vendorProfile?.businessName,
-          rating: vendor.vendorProfile?.rating,
-          reviewCount: vendor.vendorProfile?.reviewCount
-        },
-        products,
-        pagination: {
-          page: parseInt(page),
-          limit: parseInt(limit),
-          total,
-          pages: Math.ceil(total / limit)
+      data: analytics
+    });
+  });
+
+  // Generate comprehensive product analytics
+  async generateProductAnalytics(productId, dateRange = 30) {
+    const startDate = new Date(Date.now() - dateRange * 24 * 60 * 60 * 1000);
+
+    // Get view analytics
+    const viewAnalytics = await this.getViewAnalytics(productId, startDate);
+
+    // Get sales analytics
+    const salesAnalytics = await this.getSalesAnalytics(productId, startDate);
+
+    // Get conversion analytics
+    const conversionAnalytics = await this.getConversionAnalytics(productId, startDate);
+
+    // Get review analytics
+    const reviewAnalytics = await this.getReviewAnalytics(productId, startDate);
+
+    // Get traffic sources
+    const trafficSources = await this.getTrafficSources(productId, startDate);
+
+    return {
+      overview: {
+        totalViews: viewAnalytics.total,
+        totalSales: salesAnalytics.total,
+        conversionRate: conversionAnalytics.rate,
+        averageRating: reviewAnalytics.average,
+        revenue: salesAnalytics.revenue
+      },
+      views: viewAnalytics,
+      sales: salesAnalytics,
+      conversions: conversionAnalytics,
+      reviews: reviewAnalytics,
+      traffic: trafficSources,
+      trends: await this.getAnalyticsTrends(productId, startDate),
+      comparisons: await this.getProductComparisons(productId)
+    };
+  }
+
+  // Get view analytics
+  async getViewAnalytics(productId, startDate) {
+    // Mock implementation
+    return {
+      total: 1250,
+      daily: 42,
+      unique: 890,
+      bounceRate: 0.35,
+      avgTimeOnPage: 125
+    };
+  }
+
+  // Get sales analytics
+  async getSalesAnalytics(productId, startDate) {
+    const salesData = await Order.aggregate([
+      {
+        $match: {
+          'items.product': mongoose.Types.ObjectId(productId),
+          status: { $in: ['completed', 'delivered'] },
+          createdAt: { $gte: startDate }
+        }
+      },
+      {
+        $group: {
+          _id: null,
+          totalSales: { $sum: 1 },
+          totalRevenue: { $sum: '$pricing.totalAmount' },
+          totalQuantity: { $sum: { $sum: '$items.quantity' } }
         }
       }
-    });
+    ]);
 
-  } catch (error) {
-    console.error('Get products by vendor error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Failed to fetch products by vendor'
-    });
+    return salesData[0] || { totalSales: 0, totalRevenue: 0, totalQuantity: 0 };
   }
-};
 
-// @desc    Search products
-// @route   GET /api/products/search
-// @access  Public
-const searchProducts = async (req, res) => {
-  try {
-    const {
-      q: query,
-      page = 1,
-      limit = 20,
-      category,
-      minPrice,
-      maxPrice,
-      rating,
-      inStock,
-      sortBy = 'relevance',
-      sortOrder = 'desc'
-    } = req.query;
-
-    if (!query) {
-      return res.status(400).json({
-        success: false,
-        error: 'Search query is required'
-      });
-    }
-
-    // Use Product.search method
-    const products = await Product.search(query, {
-      category,
-      minPrice,
-      maxPrice,
-      inStock: inStock === 'true'
-    });
-
-    // Apply sorting
-    let sortedProducts = products;
-    if (sortBy === 'price') {
-      sortedProducts = products.sort((a, b) => sortOrder === 'desc' ? b.price - a.price : a.price - b.price);
-    } else if (sortBy === 'rating') {
-      sortedProducts = products.sort((a, b) => sortOrder === 'desc' ? b.rating.average - a.rating.average : a.rating.average - b.rating.average);
-    } else if (sortBy === 'newest') {
-      sortedProducts = products.sort((a, b) => sortOrder === 'desc' ? b.createdAt - a.createdAt : a.createdAt - b.createdAt);
-    } else if (sortBy === 'popular') {
-      sortedProducts = products.sort((a, b) => sortOrder === 'desc' ? b.statistics.views - a.statistics.views : a.statistics.views - b.statistics.views);
-    }
-
-    // Apply pagination
-    const startIndex = (page - 1) * limit;
-    const endIndex = startIndex + limit;
-    const paginatedProducts = sortedProducts.slice(startIndex, endIndex);
-
-    // Get filter options
-    const filterOptions = await getFilterOptions();
-
-    res.json({
-      success: true,
-      data: {
-        query,
-        products: paginatedProducts,
-        pagination: {
-          page: parseInt(page),
-          limit: parseInt(limit),
-          total: products.length,
-          pages: Math.ceil(products.length / limit)
-        },
-        filters: filterOptions,
-        suggestions: await getSearchSuggestions(query)
-      }
-    });
-
-  } catch (error) {
-    console.error('Search products error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Failed to search products'
-    });
+  // Get conversion analytics
+  async getConversionAnalytics(productId, startDate) {
+    // Mock implementation
+    return {
+      rate: 0.032,
+      cartAdditions: 156,
+      wishlistAdditions: 89,
+      shares: 23
+    };
   }
-};
 
-// @desc    Get product recommendations
-// @route   GET /api/products/:id/recommendations
-// @access  Public
-const getProductRecommendations = async (req, res) => {
-  try {
-    const { id } = req.params;
+  // Get review analytics
+  async getReviewAnalytics(productId, startDate) {
+    const reviewStats = await Review.getReviewStats(productId);
+    return reviewStats;
+  }
+
+  // Get traffic sources
+  async getTrafficSources(productId, startDate) {
+    // Mock implementation
+    return {
+      direct: 45,
+      search: 30,
+      social: 15,
+      referral: 10
+    };
+  }
+
+  // Get analytics trends
+  async getAnalyticsTrends(productId, startDate) {
+    // Mock implementation
+    return {
+      views: 'increasing',
+      sales: 'stable',
+      rating: 'improving'
+    };
+  }
+
+  // Get product comparisons
+  async getProductComparisons(productId) {
+    // Mock implementation
+    return {
+      categoryAverage: {
+        price: 45.50,
+        rating: 4.2,
+        sales: 125
+      },
+      similarProducts: []
+    };
+  }
+
+  // ===============================
+  // PRODUCT RECOMMENDATIONS
+  // ===============================
+
+  // Get product recommendations
+  getRecommendations = catchAsync(async (req, res) => {
+    const { productId } = req.params;
     const { type = 'related', limit = 10 } = req.query;
 
-    const product = await Product.findById(id);
+    const product = await Product.findById(productId);
+
     if (!product) {
-      return res.status(404).json({
-        success: false,
-        error: 'Product not found'
-      });
+      throw new AppError('Product not found', 404, true, 'PRODUCT_NOT_FOUND');
     }
 
     let recommendations = [];
 
     switch (type) {
       case 'related':
-        recommendations = await Product.find({
-          category: product.category,
-          _id: { $ne: product._id },
-          status: 'active',
-          visibility: 'public'
-        })
-        .limit(parseInt(limit))
-        .select('name slug price images rating')
-        .sort({ 'statistics.views': -1 });
+        recommendations = await this.getRelatedProducts(productId, limit);
         break;
-
-      case 'frequently_bought_together':
-        // This would require order analysis
-        recommendations = await Product.find({
-          _id: { $ne: product._id },
-          status: 'active',
-          visibility: 'public'
-        })
-        .limit(parseInt(limit))
-        .select('name slug price images rating');
+      case 'upsell':
+        recommendations = await this.getUpsellProducts(productId, limit);
         break;
-
-      case 'similar':
-        recommendations = await Product.find({
-          $or: [
-            { brand: product.brand },
-            { tags: { $in: product.tags } }
-          ],
-          _id: { $ne: product._id },
-          status: 'active',
-          visibility: 'public'
-        })
-        .limit(parseInt(limit))
-        .select('name slug price images rating');
+      case 'cross_sell':
+        recommendations = await this.getCrossSellProducts(productId, limit);
         break;
-
+      case 'personalized':
+        recommendations = await this.getPersonalizedRecommendations(productId, req.user?.id, limit);
+        break;
       case 'trending':
-        recommendations = await Product.find({
-          trending: true,
-          status: 'active',
-          visibility: 'public'
-        })
-        .limit(parseInt(limit))
-        .select('name slug price images rating')
-        .sort({ 'statistics.views': -1 });
+        recommendations = await this.getTrendingProducts(limit);
+        break;
+      case 'bestsellers':
+        recommendations = await this.getBestsellingProducts(productId, limit);
         break;
     }
 
-    res.json({
+    res.status(200).json({
       success: true,
       data: {
         recommendations,
         type,
-        count: recommendations.length
+        algorithm: this.getRecommendationAlgorithm(type)
       }
     });
+  });
 
-  } catch (error) {
-    console.error('Get product recommendations error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Failed to fetch product recommendations'
-    });
-  }
-};
+  // Get related products
+  async getRelatedProducts(productId, limit = 10) {
+    const product = await Product.findById(productId);
 
-// @desc    Get product statistics
-// @route   GET /api/products/:id/statistics
-// @access  Private (Vendor/Admin)
-const getProductStatistics = async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { period = '30d' } = req.query;
-    const userId = req.user._id;
-
-    const product = await Product.findById(id);
-    if (!product) {
-      return res.status(404).json({
-        success: false,
-        error: 'Product not found'
-      });
+    if (!product.relatedProducts || product.relatedProducts.length === 0) {
+      // Find products in same category
+      return await Product.find({
+        category: product.category,
+        _id: { $ne: productId },
+        status: 'published',
+        isDeleted: false
+      })
+      .populate('vendor', 'firstName lastName')
+      .populate('store', 'name slug')
+      .limit(limit);
     }
 
-    // Check ownership
-    if (product.vendor.toString() !== userId.toString() && req.user.role !== 'admin') {
-      return res.status(403).json({
-        success: false,
-        error: 'Access denied. You can only view statistics for your own products.'
-      });
-    }
-
-    // Calculate date range
-    const daysBack = parseInt(period.replace('d', ''));
-    const startDate = new Date(Date.now() - (daysBack * 24 * 60 * 60 * 1000));
-
-    // Get analytics data
-    const analytics = product.getAnalytics(startDate);
-
-    // Get review analytics
-    const Review = require('../models/Review');
-    const reviewAnalytics = await Review.aggregate([
-      { $match: { product: product._id, createdAt: { $gte: startDate } } },
-      {
-        $group: {
-          _id: '$rating',
-          count: { $sum: 1 }
-        }
-      }
-    ]);
-
-    res.json({
-      success: true,
-      data: {
-        product: {
-          id: product._id,
-          name: product.name,
-          sku: product.sku
-        },
-        period,
-        analytics: {
-          ...analytics,
-          reviewDistribution: reviewAnalytics,
-          conversionRate: analytics.views > 0 ? (analytics.conversions / analytics.views) * 100 : 0
-        }
-      }
-    });
-
-  } catch (error) {
-    console.error('Get product statistics error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Failed to fetch product statistics'
-    });
-  }
-};
-
-// @desc    Bulk update products
-// @route   PUT /api/products/bulk-update
-// @access  Private (Vendor/Admin)
-const bulkUpdateProducts = async (req, res) => {
-  try {
-    const { productIds, updates } = req.body;
-    const userId = req.user._id;
-
-    if (!productIds || !Array.isArray(productIds) || productIds.length === 0) {
-      return res.status(400).json({
-        success: false,
-        error: 'Please provide product IDs'
-      });
-    }
-
-    if (!updates || Object.keys(updates).length === 0) {
-      return res.status(400).json({
-        success: false,
-        error: 'Please provide updates'
-      });
-    }
-
-    // Verify ownership of all products
-    const products = await Product.find({
-      _id: { $in: productIds },
-      vendor: userId
-    });
-
-    if (products.length !== productIds.length) {
-      return res.status(403).json({
-        success: false,
-        error: 'Access denied. You can only update your own products.'
-      });
-    }
-
-    // Apply updates
-    const updateData = {};
-    Object.keys(updates).forEach(key => {
-      if (key === 'price' || key === 'compareAtPrice') {
-        updateData[key] = parseFloat(updates[key]);
-      } else if (key === 'status' || key === 'visibility' || key === 'featured' || key === 'trending') {
-        updateData[key] = updates[key];
-      }
-    });
-
-    const result = await Product.updateMany(
-      { _id: { $in: productIds }, vendor: userId },
-      { $set: updateData }
-    );
-
-    res.json({
-      success: true,
-      message: `${result.modifiedCount} products updated successfully`,
-      data: {
-        updatedCount: result.modifiedCount,
-        matchedCount: result.matchedCount
-      }
-    });
-
-  } catch (error) {
-    console.error('Bulk update products error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Failed to bulk update products'
-    });
-  }
-};
-
-// @desc    Get filter options
-// @route   GET /api/products/filters
-// @access  Public
-const getFilterOptions = async (req, res) => {
-  try {
-    const categories = await Category.find({ status: 'active' })
-      .select('name slug')
-      .sort({ name: 1 });
-
-    const brands = await Product.distinct('brand', {
-      status: 'active',
-      visibility: 'public',
-      brand: { $ne: null, $ne: '' }
-    });
-
-    const priceRanges = [
-      { min: 0, max: 25, label: 'Under $25' },
-      { min: 25, max: 50, label: '$25 - $50' },
-      { min: 50, max: 100, label: '$50 - $100' },
-      { min: 100, max: 200, label: '$100 - $200' },
-      { min: 200, max: 500, label: '$200 - $500' },
-      { min: 500, max: null, label: 'Over $500' }
-    ];
-
-    res.json({
-      success: true,
-      data: {
-        categories,
-        brands: brands.filter(brand => brand).sort(),
-        priceRanges,
-        ratings: [5, 4, 3, 2, 1]
-      }
-    });
-
-  } catch (error) {
-    console.error('Get filter options error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Failed to fetch filter options'
-    });
-  }
-};
-
-// @desc    Get search suggestions
-// @route   GET /api/products/search/suggestions
-// @access  Public
-const getSearchSuggestions = async (req, res) => {
-  try {
-    const { q: query } = req.query;
-
-    if (!query || query.length < 2) {
-      return res.json({
-        success: true,
-        data: {
-          suggestions: []
-        }
-      });
-    }
-
-    // Get product name suggestions
-    const productSuggestions = await Product.find({
-      name: { $regex: query, $options: 'i' },
-      status: 'active',
-      visibility: 'public'
+    const relatedIds = product.relatedProducts.map(rp => rp.product);
+    return await Product.find({
+      _id: { $in: relatedIds },
+      status: 'published',
+      isDeleted: false
     })
-    .limit(5)
-    .select('name slug')
-    .sort({ 'statistics.views': -1 });
-
-    // Get category suggestions
-    const categorySuggestions = await Category.find({
-      name: { $regex: query, $options: 'i' },
-      status: 'active'
-    })
-    .limit(3)
-    .select('name slug');
-
-    // Get brand suggestions
-    const brandSuggestions = await Product.distinct('brand', {
-      brand: { $regex: query, $options: 'i' },
-      status: 'active',
-      visibility: 'public'
-    });
-
-    const suggestions = [
-      ...productSuggestions.map(p => ({ type: 'product', text: p.name, slug: p.slug })),
-      ...categorySuggestions.map(c => ({ type: 'category', text: c.name, slug: c.slug })),
-      ...brandSuggestions.slice(0, 3).map(b => ({ type: 'brand', text: b }))
-    ];
-
-    res.json({
-      success: true,
-      data: {
-        suggestions: suggestions.slice(0, 8)
-      }
-    });
-
-  } catch (error) {
-    console.error('Get search suggestions error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Failed to fetch search suggestions'
-    });
+    .populate('vendor', 'firstName lastName')
+    .populate('store', 'name slug');
   }
-};
 
-// @desc    Compare products
-// @route   POST /api/products/compare
-// @access  Public
-const compareProducts = async (req, res) => {
-  try {
-    const { productIds } = req.body;
+  // Get upsell products
+  async getUpsellProducts(productId, limit = 10) {
+    const product = await Product.findById(productId);
 
-    if (!productIds || !Array.isArray(productIds) || productIds.length === 0) {
-      return res.status(400).json({
-        success: false,
-        error: 'Please provide product IDs'
-      });
-    }
-
-    if (productIds.length > 4) {
-      return res.status(400).json({
-        success: false,
-        error: 'Maximum 4 products can be compared at once'
-      });
-    }
-
-    const products = await Product.find({
-      _id: { $in: productIds },
-      status: 'active',
-      visibility: 'public'
+    // Find higher-priced products in same category
+    return await Product.find({
+      category: product.category,
+      price: { $gt: product.price },
+      status: 'published',
+      isDeleted: false
     })
-    .populate('category', 'name slug')
-    .populate('vendor', 'firstName lastName businessName')
-    .select('name slug sku price compareAtPrice images rating category vendor specifications features benefits dimensions weight shipping');
+    .populate('vendor', 'firstName lastName')
+    .populate('store', 'name slug')
+    .sort({ price: 1 })
+    .limit(limit);
+  }
 
-    if (products.length !== productIds.length) {
-      return res.status(404).json({
-        success: false,
-        error: 'Some products not found'
-      });
-    }
+  // Get cross-sell products
+  async getCrossSellProducts(productId, limit = 10) {
+    const product = await Product.findById(productId);
 
-    // Group specifications for comparison
-    const allSpecNames = [...new Set(products.flatMap(p => p.specifications.map(s => s.name)))];
-    const comparisonData = {
-      products: products.map(p => ({
-        id: p._id,
-        name: p.name,
-        slug: p.slug,
-        sku: p.sku,
-        price: p.price,
-        compareAtPrice: p.compareAtPrice,
-        images: p.images,
-        rating: p.rating,
-        category: p.category,
-        vendor: p.vendor,
-        specifications: allSpecNames.reduce((acc, specName) => {
-          const spec = p.specifications.find(s => s.name === specName);
-          acc[specName] = spec ? spec.value : 'N/A';
-          return acc;
-        }, {}),
-        features: p.features,
-        benefits: p.benefits,
-        dimensions: p.dimensions,
-        weight: p.weight,
-        shipping: p.shipping
-      })),
-      specificationNames: allSpecNames
+    // Find complementary products
+    return await Product.find({
+      tags: { $in: product.tags },
+      _id: { $ne: productId },
+      status: 'published',
+      isDeleted: false
+    })
+    .populate('vendor', 'firstName lastName')
+    .populate('store', 'name slug')
+    .limit(limit);
+  }
+
+  // Get personalized recommendations
+  async getPersonalizedRecommendations(productId, userId, limit = 10) {
+    if (!userId) return [];
+
+    // Get user's purchase history and preferences
+    const userOrders = await Order.findByUser(userId, { limit: 50 });
+    const userCart = await Cart.findOne({ user: userId });
+
+    // Analyze user's preferences
+    const preferences = await this.analyzeUserPreferences(userId, userOrders, userCart);
+
+    // Find products matching preferences
+    let query = {
+      status: 'published',
+      isDeleted: false,
+      _id: { $ne: productId }
     };
 
-    res.json({
-      success: true,
-      data: comparisonData
-    });
+    if (preferences.categories.length > 0) {
+      query.category = { $in: preferences.categories };
+    }
 
-  } catch (error) {
-    console.error('Compare products error:', error);
-    res.status(500).json({
-      success: false,
-      error: 'Failed to compare products'
-    });
+    if (preferences.priceRange) {
+      query.price = {
+        $gte: preferences.priceRange.min,
+        $lte: preferences.priceRange.max
+      };
+    }
+
+    return await Product.find(query)
+      .populate('vendor', 'firstName lastName')
+      .populate('store', 'name slug')
+      .sort({ 'rating.average': -1 })
+      .limit(limit);
   }
-};
 
-module.exports = {
-  createProduct,
-  getProducts,
-  getProduct,
-  updateProduct,
-  deleteProduct,
-  updateProductInventory,
-  addProductImages,
-  removeProductImage,
-  setPrimaryImage,
-  addProductVariant,
-  updateProductVariant,
-  removeProductVariant,
-  getProductReviews,
-  addProductReview,
-  updateProductReview,
-  deleteProductReview,
-  markReviewHelpful,
-  getFeaturedProducts,
-  getTrendingProducts,
-  getProductsByCategory,
-  getProductsByVendor,
-  searchProducts,
-  getProductRecommendations,
-  getProductStatistics,
-  bulkUpdateProducts,
-  getFilterOptions,
-  getSearchSuggestions,
-  compareProducts
-};
+  // Analyze user preferences
+  async analyzeUserPreferences(userId, orders, cart) {
+    const categories = [];
+    const priceRange = { min: 0, max: 1000 };
+
+    // Analyze order history
+    if (orders && orders.length > 0) {
+      const allItems = orders.flatMap(order => order.items);
+
+      // Get most purchased categories
+      const categoryCount = {};
+      allItems.forEach(item => {
+        if (categoryCount[item.product.category]) {
+          categoryCount[item.product.category]++;
+        } else {
+          categoryCount[item.product.category] = 1;
+        }
+      });
+
+      categories.push(...Object.keys(categoryCount).slice(0, 3));
+
+      // Get price range
+      const prices = allItems.map(item => item.price);
+      priceRange.min = Math.min(...prices) * 0.5;
+      priceRange.max = Math.max(...prices) * 1.5;
+    }
+
+    return { categories, priceRange };
+  }
+
+  // Get trending products
+  async getTrendingProducts(limit = 10) {
+    return await Product.getTrendingProducts(7, limit);
+  }
+
+  // Get bestselling products
+  async getBestsellingProducts(productId, limit = 10) {
+    const product = await Product.findById(productId);
+
+    return await Product.find({
+      category: product.category,
+      _id: { $ne: productId },
+      status: 'published',
+      isDeleted: false
+    })
+    .populate('vendor', 'firstName lastName')
+    .populate('store', 'name slug')
+    .sort({ 'stats.salesCount': -1 })
+    .limit(limit);
+  }
+
+  // Get recommendation algorithm info
+  getRecommendationAlgorithm(type) {
+    const algorithms = {
+      'related': 'Category and tag-based similarity',
+      'upsell': 'Higher-priced products in same category',
+      'cross_sell': 'Tag-based complementary products',
+      'personalized': 'User behavior and purchase history analysis',
+      'trending': 'Recent view and purchase activity',
+      'bestsellers': 'Sales count ranking in category'
+    };
+
+    return algorithms[type] || 'General recommendation algorithm';
+  }
+
+  // ===============================
+  // BULK OPERATIONS
+  // ===============================
+
+  // Bulk update products
+  bulkUpdateProducts = catchAsync(async (req, res) => {
+    const { productIds, updates } = req.body;
+
+    if (!productIds || !Array.isArray(productIds) || productIds.length === 0) {
+      throw new AppError('Product IDs array is required', 400, true, 'INVALID_PRODUCT_IDS');
+    }
+
+    // Verify permissions for all products
+    const products = await Product.find({
+      _id: { $in: productIds },
+      isDeleted: false
+    });
+
+    for (const product of products) {
+      if (product.vendor.toString() !== req.user.id && req.user.role !== 'admin') {
+        throw new AppError(`Not authorized to update product ${product._id}`, 403, true, 'NOT_AUTHORIZED');
+      }
+    }
+
+    const result = await Product.bulkUpdate(productIds, updates);
+
+    logger.info('Products bulk updated', {
+      userId: req.user.id,
+      productCount: productIds.length,
+      updates: Object.keys(updates)
+    });
+
+    res.status(200).json({
+      success: true,
+      message: 'Products updated successfully',
+      data: {
+        updatedCount: result.modifiedCount,
+        productIds
+      }
+    });
+  });
+
+  // Bulk delete products
+  bulkDeleteProducts = catchAsync(async (req, res) => {
+    const { productIds, permanent = false } = req.body;
+
+    if (!productIds || !Array.isArray(productIds) || productIds.length === 0) {
+      throw new AppError('Product IDs array is required', 400, true, 'INVALID_PRODUCT_IDS');
+    }
+
+    // Verify permissions for all products
+    const products = await Product.find({
+      _id: { $in: productIds },
+      isDeleted: false
+    });
+
+    for (const product of products) {
+      if (product.vendor.toString() !== req.user.id && req.user.role !== 'admin') {
+        throw new AppError(`Not authorized to delete product ${product._id}`, 403, true, 'NOT_AUTHORIZED');
+      }
+    }
+
+    let deletedCount = 0;
+
+    for (const product of products) {
+      if (permanent) {
+        // Permanent deletion
+        await Product.findByIdAndDelete(product._id);
+        deletedCount++;
+      } else {
+        // Soft deletion
+        product.isDeleted = true;
+        product.deletedAt = new Date();
+        product.deletedBy = req.user.id;
+        await product.save();
+        await product.archive();
+        deletedCount++;
+      }
+    }
+
+    logger.info('Products bulk deleted', {
+      userId: req.user.id,
+      productCount: deletedCount,
+      permanent
+    });
+
+    res.status(200).json({
+      success: true,
+      message: 'Products deleted successfully',
+      data: {
+        deletedCount,
+        productIds
+      }
+    });
+  });
+
+  // Import products
+  importProducts = catchAsync(async (req, res) => {
+    if (!req.file) {
+      throw new AppError('No import file provided', 400, true, 'NO_IMPORT_FILE');
+    }
+
+    const user = await User.findById(req.user.id);
+    const store = await Store.findById(user.vendorProfile.store);
+
+    // Parse CSV/Excel file
+    const products = await this.parseImportFile(req.file.path);
+
+    let imported = 0;
+    let errors = [];
+
+    for (const productData of products) {
+      try {
+        const product = new Product({
+          ...productData,
+          vendor: user._id,
+          store: store._id,
+          status: 'draft',
+          createdBy: user._id
+        });
+
+        await product.save();
+        imported++;
+      } catch (error) {
+        errors.push({
+          data: productData,
+          error: error.message
+        });
+      }
+    }
+
+    // Update store analytics
+    await store.updateAnalytics();
+
+    logger.info('Products imported', {
+      userId: user._id,
+      imported,
+      errors: errors.length
+    });
+
+    res.status(200).json({
+      success: true,
+      message: 'Import completed',
+      data: {
+        imported,
+        errors,
+        total: products.length
+      }
+    });
+  });
+
+  // Export products
+  exportProducts = catchAsync(async (req, res) => {
+    const {
+      format = 'csv',
+      category,
+      vendor,
+      status,
+      dateFrom,
+      dateTo
+    } = req.query;
+
+    let query = { isDeleted: false };
+
+    if (category) query.category = category;
+    if (vendor) query.vendor = vendor;
+    if (status) query.status = status;
+    if (dateFrom || dateTo) {
+      query.createdAt = {};
+      if (dateFrom) query.createdAt.$gte = new Date(dateFrom);
+      if (dateTo) query.createdAt.$lte = new Date(dateTo);
+    }
+
+    const products = await Product.find(query)
+      .populate('vendor', 'firstName lastName email')
+      .populate('store', 'name')
+      .populate('category', 'name');
+
+    // Generate export file
+    const exportData = await this.generateExportFile(products, format);
+
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', `attachment; filename="products.${format}"`);
+
+    res.status(200).send(exportData);
+  });
+
+  // Parse import file
+  async parseImportFile(filePath) {
+    // Implementation for parsing CSV/Excel files
+    return [];
+  }
+
+  // Generate export file
+  async generateExportFile(products, format) {
+    // Implementation for generating CSV/Excel files
+    return 'product data...';
+  }
+
+  // ===============================
+  // VENDOR PRODUCT MANAGEMENT
+  // ===============================
+
+  // Get vendor products
+  getVendorProducts = catchAsync(async (req, res) => {
+    const user = await User.findById(req.user.id);
+    const {
+      status = 'all',
+      category,
+      search,
+      sortBy = 'createdAt',
+      page = 1,
+      limit = 20
+    } = req.query;
+
+    let query = { vendor: user._id, isDeleted: false };
+
+    if (status !== 'all') {
+      query.status = status;
+    }
+
+    if (category) {
+      query.category = category;
+    }
+
+    if (search) {
+      query.$or = [
+        { name: { $regex: search, $options: 'i' } },
+        { sku: { $regex: search, $options: 'i' } },
+        { description: { $regex: search, $options: 'i' } }
+      ];
+    }
+
+    let sort = {};
+    switch (sortBy) {
+      case 'name':
+        sort = { name: 1 };
+        break;
+      case 'price':
+        sort = { price: -1 };
+        break;
+      case 'stock':
+        sort = { 'inventory.quantity': 1 };
+        break;
+      case 'sales':
+        sort = { 'stats.salesCount': -1 };
+        break;
+      case 'updated':
+        sort = { updatedAt: -1 };
+        break;
+      default:
+        sort = { createdAt: -1 };
+    }
+
+    const products = await Product.find(query)
+      .populate('category', 'name slug')
+      .sort(sort)
+      .limit(limit * 1)
+      .skip((page - 1) * limit);
+
+    const total = await Product.countDocuments(query);
+
+    // Get store analytics
+    const store = await Store.findById(user.vendorProfile.store);
+    const analytics = store ? await store.getDashboardData(30) : null;
+
+    res.status(200).json({
+      success: true,
+      data: {
+        products,
+        analytics,
+        pagination: {
+          currentPage: parseInt(page),
+          totalPages: Math.ceil(total / limit),
+          totalProducts: total,
+          hasNext: page < Math.ceil(total / limit),
+          hasPrev: page > 1
+        }
+      }
+    });
+  });
+
+  // Duplicate product
+  duplicateProduct = catchAsync(async (req, res) => {
+    const { productId } = req.params;
+    const { name, modifications = {} } = req.body;
+
+    const originalProduct = await Product.findById(productId);
+
+    if (!originalProduct) {
+      throw new AppError('Product not found', 404, true, 'PRODUCT_NOT_FOUND');
+    }
+
+    // Check permissions
+    if (originalProduct.vendor.toString() !== req.user.id && req.user.role !== 'admin') {
+      throw new AppError('Not authorized to duplicate this product', 403, true, 'NOT_AUTHORIZED');
+    }
+
+    const duplicatedProduct = await originalProduct.clone();
+
+    // Apply modifications
+    if (name) {
+      duplicatedProduct.name = name;
+      duplicatedProduct.slug = undefined; // Will be regenerated
+    }
+
+    Object.keys(modifications).forEach(key => {
+      if (modifications[key] !== undefined) {
+        duplicatedProduct[key] = modifications[key];
+      }
+    });
+
+    await duplicatedProduct.save();
+
+    logger.info('Product duplicated', {
+      originalProductId: productId,
+      newProductId: duplicatedProduct._id,
+      userId: req.user.id
+    });
+
+    res.status(201).json({
+      success: true,
+      message: 'Product duplicated successfully',
+      data: duplicatedProduct
+    });
+  });
+
+  // ===============================
+  // PRICE & PROMOTION MANAGEMENT
+  // ===============================
+
+  // Update product price
+  updatePrice = catchAsync(async (req, res) => {
+    const { productId } = req.params;
+    const { price, compareAtPrice } = req.body;
+
+    const product = await Product.findById(productId);
+
+    if (!product) {
+      throw new AppError('Product not found', 404, true, 'PRODUCT_NOT_FOUND');
+    }
+
+    // Check permissions
+    if (product.vendor.toString() !== req.user.id && req.user.role !== 'admin') {
+      throw new AppError('Not authorized to update price', 403, true, 'NOT_AUTHORIZED');
+    }
+
+    const oldPrice = product.price;
+    product.price = price;
+    if (compareAtPrice !== undefined) {
+      product.compareAtPrice = compareAtPrice;
+    }
+
+    await product.save();
+
+    // Add price history
+    await this.addPriceHistory(productId, {
+      oldPrice,
+      newPrice: price,
+      compareAtPrice,
+      updatedBy: req.user.id
+    });
+
+    logger.info('Product price updated', {
+      productId,
+      oldPrice,
+      newPrice: price,
+      userId: req.user.id
+    });
+
+    res.status(200).json({
+      success: true,
+      message: 'Price updated successfully',
+      data: {
+        product: product._id,
+        oldPrice,
+        newPrice: price,
+        discount: product.discountPercentage
+      }
+    });
+  });
+
+  // Add price history
+  async addPriceHistory(productId, historyData) {
+    // Implementation for price history tracking
+    logger.info('Price history added', { productId, ...historyData });
+  }
+
+  // Set product discount
+  setDiscount = catchAsync(async (req, res) => {
+    const { productId } = req.params;
+    const { type, value, startDate, endDate } = req.body;
+
+    const product = await Product.findById(productId);
+
+    if (!product) {
+      throw new AppError('Product not found', 404, true, 'PRODUCT_NOT_FOUND');
+    }
+
+    // Check permissions
+    if (product.vendor.toString() !== req.user.id && req.user.role !== 'admin') {
+      throw new AppError('Not authorized to set discount', 403, true, 'NOT_AUTHORIZED');
+    }
+
+    product.discount = {
+      type,
+      value,
+      startDate: startDate ? new Date(startDate) : new Date(),
+      endDate: endDate ? new Date(endDate) : null,
+      isActive: true
+    };
+
+    await product.save();
+
+    logger.info('Product discount set', {
+      productId,
+      discountType: type,
+      discountValue: value,
+      userId: req.user.id
+    });
+
+    res.status(200).json({
+      success: true,
+      message: 'Discount set successfully',
+      data: {
+        product: product._id,
+        discount: product.discount
+      }
+    });
+  });
+
+  // Remove product discount
+  removeDiscount = catchAsync(async (req, res) => {
+    const { productId } = req.params;
+
+    const product = await Product.findById(productId);
+
+    if (!product) {
+      throw new AppError('Product not found', 404, true, 'PRODUCT_NOT_FOUND');
+    }
+
+    product.discount = {
+      type: 'percentage',
+      value: 0,
+      isActive: false
+    };
+
+    await product.save();
+
+    logger.info('Product discount removed', {
+      productId,
+      userId: req.user.id
+    });
+
+    res.status(200).json({
+      success: true,
+      message: 'Discount removed successfully'
+    });
+  });
+
+  // ===============================
+  // ADMIN PRODUCT MANAGEMENT
+  // ===============================
+
+  // Get all products (admin)
+  getAllProductsAdmin = catchAsync(async (req, res) => {
+    const {
+      status,
+      category,
+      vendor,
+      featured,
+      search,
+      sortBy = 'createdAt',
+      page = 1,
+      limit = 20
+    } = req.query;
+
+    let query = {};
+
+    if (status) query.status = status;
+    if (category) query.category = category;
+    if (vendor) query.vendor = vendor;
+    if (featured !== undefined) query.featured = featured === 'true';
+    if (search) {
+      query.$or = [
+        { name: { $regex: search, $options: 'i' } },
+        { sku: { $regex: search, $options: 'i' } },
+        { brand: { $regex: search, $options: 'i' } }
+      ];
+    }
+
+    let sort = {};
+    switch (sortBy) {
+      case 'name':
+        sort = { name: 1 };
+        break;
+      case 'price':
+        sort = { price: -1 };
+        break;
+      case 'sales':
+        sort = { 'stats.salesCount': -1 };
+        break;
+      case 'rating':
+        sort = { 'rating.average': -1 };
+        break;
+      default:
+        sort = { createdAt: -1 };
+    }
+
+    const products = await Product.find(query)
+      .populate('vendor', 'firstName lastName email')
+      .populate('store', 'name')
+      .populate('category', 'name')
+      .sort(sort)
+      .limit(limit * 1)
+      .skip((page - 1) * limit);
+
+    const total = await Product.countDocuments(query);
+
+    res.status(200).json({
+      success: true,
+      data: {
+        products,
+        pagination: {
+          currentPage: parseInt(page),
+          totalPages: Math.ceil(total / limit),
+          totalProducts: total,
+          hasNext: page < Math.ceil(total / limit),
+          hasPrev: page > 1
+        }
+      }
+    });
+  });
+
+  // Approve product (admin)
+  approveProduct = catchAsync(async (req, res) => {
+    const { productId } = req.params;
+
+    const product = await Product.findById(productId);
+
+    if (!product) {
+      throw new AppError('Product not found', 404, true, 'PRODUCT_NOT_FOUND');
+    }
+
+    product.status = 'published';
+    product.publishedAt = new Date();
+    await product.save();
+
+    // Update category stats
+    const category = await Category.findById(product.category);
+    if (category) await category.updateStats();
+
+    // Update store stats
+    const store = await Store.findById(product.store);
+    if (store) await store.updateAnalytics();
+
+    // Send notification to vendor
+    await Notification.createNotification(product.vendor, {
+      type: 'product',
+      category: 'informational',
+      title: 'Product Approved',
+      message: `Your product "${product.name}" has been approved and is now live.`,
+      data: {
+        productId: product._id,
+        productName: product.name
+      },
+      priority: 'normal',
+      actions: [
+        {
+          type: 'link',
+          label: 'View Product',
+          url: `/products/${product.slug}`,
+          action: 'view_product'
+        }
+      ]
+    });
+
+    logger.info('Product approved by admin', {
+      productId,
+      adminId: req.user.id
+    });
+
+    res.status(200).json({
+      success: true,
+      message: 'Product approved successfully',
+      data: product
+    });
+  });
+
+  // Reject product (admin)
+  rejectProduct = catchAsync(async (req, res) => {
+    const { productId } = req.params;
+    const { reason } = req.body;
+
+    const product = await Product.findById(productId);
+
+    if (!product) {
+      throw new AppError('Product not found', 404, true, 'PRODUCT_NOT_FOUND');
+    }
+
+    product.status = 'draft';
+    await product.save();
+
+    // Send notification to vendor
+    await Notification.createNotification(product.vendor, {
+      type: 'product',
+      category: 'informational',
+      title: 'Product Requires Changes',
+      message: `Your product "${product.name}" needs revision. Reason: ${reason}`,
+      data: {
+        productId: product._id,
+        productName: product.name,
+        reason
+      },
+      priority: 'high',
+      actions: [
+        {
+          type: 'link',
+          label: 'Edit Product',
+          url: `/vendor/products/${product._id}/edit`,
+          action: 'edit_product'
+        }
+      ]
+    });
+
+    logger.info('Product rejected by admin', {
+      productId,
+      adminId: req.user.id,
+      reason
+    });
+
+    res.status(200).json({
+      success: true,
+      message: 'Product rejected successfully'
+    });
+  });
+
+  // Feature product (admin)
+  featureProduct = catchAsync(async (req, res) => {
+    const { productId } = req.params;
+
+    const product = await Product.findById(productId);
+
+    if (!product) {
+      throw new AppError('Product not found', 404, true, 'PRODUCT_NOT_FOUND');
+    }
+
+    product.featured = !product.featured;
+    await product.save();
+
+    logger.info('Product featured status changed', {
+      productId,
+      featured: product.featured,
+      adminId: req.user.id
+    });
+
+    res.status(200).json({
+      success: true,
+      message: `Product ${product.featured ? 'featured' : 'unfeatured'} successfully`,
+      data: { featured: product.featured }
+    });
+  });
+
+  // Get product statistics (admin)
+  getProductStatistics = catchAsync(async (req, res) => {
+    const { dateRange = 30 } = req.query;
+
+    const stats = await Product.getProductStats();
+
+    // Get additional analytics
+    const totalProducts = await Product.countDocuments({ isDeleted: false });
+    const publishedProducts = await Product.countDocuments({ status: 'published', isDeleted: false });
+    const draftProducts = await Product.countDocuments({ status: 'draft', isDeleted: false });
+    const featuredProducts = await Product.countDocuments({ featured: true, isDeleted: false });
+
+    res.status(200).json({
+      success: true,
+      data: {
+        overview: {
+          totalProducts,
+          publishedProducts,
+          draftProducts,
+          featuredProducts
+        },
+        statusDistribution: stats,
+        recentActivity: await this.getRecentProductActivity()
+      }
+    });
+  });
+
+  // Get recent product activity
+  async getRecentProductActivity() {
+    // Get recent product updates
+    const recentProducts = await Product.find({ isDeleted: false })
+      .sort({ createdAt: -1 })
+      .limit(10)
+      .populate('vendor', 'firstName lastName')
+      .populate('category', 'name');
+
+    // Get recent price changes
+    const recentPriceChanges = await Product.find({
+      'versions.0': { $exists: true },
+      isDeleted: false
+    })
+    .sort({ 'versions.0.createdAt': -1 })
+    .limit(10)
+    .populate('vendor', 'firstName lastName');
+
+    return {
+      recentProducts,
+      recentPriceChanges
+    };
+  }
+
+  // ===============================
+  // UTILITY METHODS
+  // ===============================
+
+  // Get low stock products
+  getLowStockProducts = catchAsync(async (req, res) => {
+    const user = await User.findById(req.user.id);
+
+    let query = {};
+    if (user.role !== 'admin') {
+      query.vendor = user._id;
+    }
+
+    const products = await Product.getLowStockProducts(user.role === 'admin' ? null : user._id);
+
+    res.status(200).json({
+      success: true,
+      data: products
+    });
+  });
+
+  // Get featured products
+  getFeaturedProducts = catchAsync(async (req, res) => {
+    const { limit = 20 } = req.query;
+
+    const products = await Product.getFeaturedProducts(parseInt(limit));
+
+    res.status(200).json({
+      success: true,
+      data: products
+    });
+  });
+
+  // Get products by category
+  getProductsByCategory = catchAsync(async (req, res) => {
+    const { categoryId } = req.params;
+    const { sortBy = 'createdAt', page = 1, limit = 20 } = req.query;
+
+    const category = await Category.findById(categoryId);
+
+    if (!category) {
+      throw new AppError('Category not found', 404, true, 'CATEGORY_NOT_FOUND');
+    }
+
+    const products = await Product.getByCategory(categoryId, {
+      limit: parseInt(limit),
+      skip: (page - 1) * limit,
+      sortBy
+    });
+
+    const total = await Product.countDocuments({
+      category: categoryId,
+      status: 'published',
+      isDeleted: false
+    });
+
+    res.status(200).json({
+      success: true,
+      data: {
+        category,
+        products,
+        pagination: {
+          currentPage: parseInt(page),
+          totalPages: Math.ceil(total / limit),
+          totalProducts: total,
+          hasNext: page < Math.ceil(total / limit),
+          hasPrev: page > 1
+        }
+      }
+    });
+  });
+
+  // Get products by price range
+  getProductsByPriceRange = catchAsync(async (req, res) => {
+    const { minPrice, maxPrice } = req.params;
+    const { page = 1, limit = 20 } = req.query;
+
+    const products = await Product.getByPriceRange(
+      parseFloat(minPrice),
+      parseFloat(maxPrice),
+      {
+        limit: parseInt(limit),
+        skip: (page - 1) * limit
+      }
+    );
+
+    const total = await Product.countDocuments({
+      price: { $gte: parseFloat(minPrice), $lte: parseFloat(maxPrice) },
+      status: 'published',
+      isDeleted: false
+    });
+
+    res.status(200).json({
+      success: true,
+      data: {
+        priceRange: { min: parseFloat(minPrice), max: parseFloat(maxPrice) },
+        products,
+        pagination: {
+          currentPage: parseInt(page),
+          totalPages: Math.ceil(total / limit),
+          totalProducts: total,
+          hasNext: page < Math.ceil(total / limit),
+          hasPrev: page > 1
+        }
+      }
+    });
+  });
+
+  // Search products
+  searchProducts = catchAsync(async (req, res) => {
+    const { q: searchTerm } = req.query;
+    const { limit = 20, page = 1 } = req.query;
+
+    if (!searchTerm) {
+      throw new AppError('Search term is required', 400, true, 'SEARCH_TERM_REQUIRED');
+    }
+
+    const products = await Product.search(searchTerm, {
+      limit: parseInt(limit),
+      skip: (page - 1) * limit
+    });
+
+    const total = await Product.countDocuments({
+      $text: { $search: searchTerm },
+      status: 'published',
+      isDeleted: false
+    });
+
+    res.status(200).json({
+      success: true,
+      data: {
+        searchTerm,
+        products,
+        pagination: {
+          currentPage: parseInt(page),
+          totalPages: Math.ceil(total / limit),
+          totalProducts: total,
+          hasNext: page < Math.ceil(total / limit),
+          hasPrev: page > 1
+        }
+      }
+    });
+  });
+
+  // Track product view
+  trackView = catchAsync(async (req, res) => {
+    const { productId } = req.params;
+
+    const product = await Product.findById(productId);
+
+    if (!product) {
+      throw new AppError('Product not found', 404, true, 'PRODUCT_NOT_FOUND');
+    }
+
+    await product.addView();
+
+    res.status(200).json({
+      success: true,
+      message: 'View tracked successfully'
+    });
+  });
+
+  // Add to wishlist
+  addToWishlist = catchAsync(async (req, res) => {
+    const { productId } = req.params;
+
+    const product = await Product.findById(productId);
+
+    if (!product) {
+      throw new AppError('Product not found', 404, true, 'PRODUCT_NOT_FOUND');
+    }
+
+    // Add to user's wishlist (implementation depends on how you store wishlists)
+    // This could be in user model or separate collection
+
+    res.status(200).json({
+      success: true,
+      message: 'Product added to wishlist'
+    });
+  });
+
+  // Remove from wishlist
+  removeFromWishlist = catchAsync(async (req, res) => {
+    const { productId } = req.params;
+
+    const product = await Product.findById(productId);
+
+    if (!product) {
+      throw new AppError('Product not found', 404, true, 'PRODUCT_NOT_FOUND');
+    }
+
+    // Remove from user's wishlist
+
+    res.status(200).json({
+      success: true,
+      message: 'Product removed from wishlist'
+    });
+  });
+
+  // Get product reviews
+  getProductReviews = catchAsync(async (req, res) => {
+    const { productId } = req.params;
+    const { sortBy = 'createdAt', page = 1, limit = 20 } = req.query;
+
+    const reviews = await Review.findByProduct(productId, {
+      sortBy,
+      limit: parseInt(limit),
+      skip: (page - 1) * limit
+    });
+
+    const total = await Review.countDocuments({
+      product: productId,
+      status: 'approved'
+    });
+
+    res.status(200).json({
+      success: true,
+      data: {
+        reviews,
+        pagination: {
+          currentPage: parseInt(page),
+          totalPages: Math.ceil(total / limit),
+          totalReviews: total,
+          hasNext: page < Math.ceil(total / limit),
+          hasPrev: page > 1
+        }
+      }
+    });
+  });
+
+  // Create product review
+  createProductReview = catchAsync(async (req, res) => {
+    const { productId } = req.params;
+    const { title, content, rating, detailedRatings, images } = req.body;
+
+    const product = await Product.findById(productId);
+
+    if (!product) {
+      throw new AppError('Product not found', 404, true, 'PRODUCT_NOT_FOUND');
+    }
+
+    // Check if user already reviewed this product
+    const existingReview = await Review.findOne({
+      user: req.user.id,
+      product: productId
+    });
+
+    if (existingReview) {
+      throw new AppError('You have already reviewed this product', 400, true, 'ALREADY_REVIEWED');
+    }
+
+    // Create review
+    const review = new Review({
+      user: req.user.id,
+      product: productId,
+      vendor: product.vendor,
+      store: product.store,
+      title,
+      content,
+      rating,
+      detailedRatings,
+      isVerifiedPurchase: false, // Would be determined by checking order history
+      status: 'pending' // Reviews need moderation
+    });
+
+    await review.save();
+
+    // Update product rating
+    await review.updateProductRating();
+
+    logger.info('Product review created', {
+      reviewId: review._id,
+      productId,
+      userId: req.user.id,
+      rating
+    });
+
+    res.status(201).json({
+      success: true,
+      message: 'Review submitted successfully and is pending approval',
+      data: review
+    });
+  });
+
+  // Get product comparison
+  compareProducts = catchAsync(async (req, res) => {
+    const { productIds } = req.body;
+
+    if (!productIds || !Array.isArray(productIds) || productIds.length < 2) {
+      throw new AppError('At least 2 product IDs are required for comparison', 400, true, 'INVALID_PRODUCT_IDS');
+    }
+
+    const products = await Product.find({
+      _id: { $in: productIds },
+      status: 'published',
+      isDeleted: false
+    })
+    .populate('vendor', 'firstName lastName')
+    .populate('store', 'name')
+    .populate('category', 'name');
+
+    if (products.length !== productIds.length) {
+      throw new AppError('Some products not found or not available', 404, true, 'PRODUCTS_NOT_FOUND');
+    }
+
+    // Generate comparison data
+    const comparison = this.generateProductComparison(products);
+
+    res.status(200).json({
+      success: true,
+      data: {
+        products,
+        comparison
+      }
+    });
+  });
+
+  // Generate product comparison
+  generateProductComparison(products) {
+    const features = [
+      'price', 'rating', 'brand', 'shipping', 'warranty',
+      'dimensions', 'weight', 'material', 'color'
+    ];
+
+    return {
+      features: features.map(feature => ({
+        name: feature,
+        values: products.map(product => product[feature] || 'N/A')
+      })),
+      summary: {
+        lowestPrice: Math.min(...products.map(p => p.price)),
+        highestRating: Math.max(...products.map(p => p.rating?.average || 0)),
+        totalProducts: products.length
+      }
+    };
+  }
+}
+
+module.exports = new ProductController();
